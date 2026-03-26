@@ -2360,12 +2360,23 @@ impl Reactor {
             .collect();
         let focus_window = focus_window.filter(|wid| self.is_window_on_active_space(*wid));
 
+        // For scrolling layouts, skip raise_windows — our SLSOrderWindow-based
+        // Z-order enforcement handles stacking. Only the focus_window needs
+        // make_key_window for focus transfer. This prevents elem.raise() calls
+        // from fighting the enforcement during rapid focus switching.
+        let is_scrolling = self.space_manager.screens.iter().any(|s| {
+            s.space
+                .map(|sp| self.layout_manager.layout_engine.scrolling_z_order(sp).is_some())
+                .unwrap_or(false)
+        });
         let mut windows_by_app_and_screen = HashMap::default();
-        for &wid in &raise_windows {
-            windows_by_app_and_screen
-                .entry((wid.pid, self.best_space_for_window_id(wid)))
-                .or_insert(vec![])
-                .push(wid);
+        if !is_scrolling {
+            for &wid in &raise_windows {
+                windows_by_app_and_screen
+                    .entry((wid.pid, self.best_space_for_window_id(wid)))
+                    .or_insert(vec![])
+                    .push(wid);
+            }
         }
         let focus_window_with_warp = focus_window.map(|wid| {
             let warp = if self.config.settings.mouse_follows_focus {
