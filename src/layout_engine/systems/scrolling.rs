@@ -305,34 +305,6 @@ impl ScrollingLayoutSystem {
         self.settings = settings.clone();
     }
 
-    /// Return all windows ordered by desired Z-order (bottom to top).
-    /// Focused column on top, then alternating left/right by proximity
-    /// (left above right at the same distance).
-    pub fn z_ordered_windows(&self, layout: LayoutId) -> Vec<WindowId> {
-        let Some(state) = self.layout_state(layout) else {
-            return Vec::new();
-        };
-        let Some((sel_col, _)) = state.selected_location() else {
-            return Self::all_windows(state);
-        };
-        let num_cols = state.columns.len();
-        let max_dist = sel_col.max(num_cols.saturating_sub(1).saturating_sub(sel_col));
-        let mut ordered = Vec::new();
-        // Furthest first (bottom Z), alternating right then left
-        for dist in (1..=max_dist).rev() {
-            let right = sel_col + dist;
-            if right < num_cols {
-                ordered.extend(state.columns[right].windows.iter());
-            }
-            if dist <= sel_col {
-                ordered.extend(state.columns[sel_col - dist].windows.iter());
-            }
-        }
-        // Focused column last (top Z)
-        ordered.extend(state.columns[sel_col].windows.iter());
-        ordered
-    }
-
     fn clamp_ratio(&self, ratio: f64) -> f64 {
         ratio
             .clamp(
@@ -793,7 +765,19 @@ impl LayoutSystem for ScrollingLayoutSystem {
                 .copied()
                 .unwrap_or((tiling.size.width * ratio).max(1.0));
             let start = column_starts.get(col_idx).copied().unwrap_or(0.0);
-            let x = anchor_x + start - offset;
+            let mut x = anchor_x + start - offset;
+            // Hide off-screen columns by clamping them to 1px visible at the
+            // screen edge. This prevents cross-app Z-order issues since
+            // macOS can't reorder other apps' windows via SLSOrderWindow.
+            let visible_left = tiling.origin.x;
+            let visible_right = tiling.origin.x + tiling.size.width;
+            if x + column_width <= visible_left {
+                // Column is fully off-screen left: hide just past the edge
+                x = visible_left - column_width;
+            } else if x >= visible_right {
+                // Column is fully off-screen right: hide just past the edge
+                x = visible_right;
+            }
             if col.windows.is_empty() {
                 continue;
             }

@@ -1104,7 +1104,6 @@ impl Reactor {
                     WorkspaceSwitchState::Active
                 ),
             );
-            self.enforce_scrolling_z_order();
             self.maybe_send_menu_update();
         }
 
@@ -2360,23 +2359,12 @@ impl Reactor {
             .collect();
         let focus_window = focus_window.filter(|wid| self.is_window_on_active_space(*wid));
 
-        // For scrolling layouts, skip raise_windows — our SLSOrderWindow-based
-        // Z-order enforcement handles stacking. Only the focus_window needs
-        // make_key_window for focus transfer. This prevents elem.raise() calls
-        // from fighting the enforcement during rapid focus switching.
-        let is_scrolling = self.space_manager.screens.iter().any(|s| {
-            s.space
-                .map(|sp| self.layout_manager.layout_engine.scrolling_z_order(sp).is_some())
-                .unwrap_or(false)
-        });
         let mut windows_by_app_and_screen = HashMap::default();
-        if !is_scrolling {
-            for &wid in &raise_windows {
-                windows_by_app_and_screen
-                    .entry((wid.pid, self.best_space_for_window_id(wid)))
-                    .or_insert(vec![])
-                    .push(wid);
-            }
+        for &wid in &raise_windows {
+            windows_by_app_and_screen
+                .entry((wid.pid, self.best_space_for_window_id(wid)))
+                .or_insert(vec![])
+                .push(wid);
         }
         let focus_window_with_warp = focus_window.map(|wid| {
             let warp = if self.config.settings.mouse_follows_focus {
@@ -2985,26 +2973,5 @@ impl Reactor {
             warn!(error = ?e, "{}", context);
             false
         })
-    }
-
-    /// Enforce Z-order for scrolling layouts: focused column on top,
-    /// adjacent columns layered by proximity (left above right at same distance).
-    fn enforce_scrolling_z_order(&self) {
-        for screen in &self.space_manager.screens {
-            let Some(space) = screen.space else { continue };
-            if !self.is_space_active(space) {
-                continue;
-            }
-            let Some(z_order) = self.layout_manager.layout_engine.scrolling_z_order(space) else {
-                continue;
-            };
-            let wsids: Vec<crate::sys::window_server::WindowServerId> = z_order
-                .iter()
-                .filter_map(|wid| {
-                    self.window_manager.windows.get(wid).and_then(|w| w.info.sys_id)
-                })
-                .collect();
-            crate::sys::window_server::order_windows_stack(&wsids);
-        }
     }
 }
