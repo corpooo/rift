@@ -1104,6 +1104,7 @@ impl Reactor {
                     WorkspaceSwitchState::Active
                 ),
             );
+            self.enforce_scrolling_z_order();
             self.maybe_send_menu_update();
         }
 
@@ -2973,5 +2974,26 @@ impl Reactor {
             warn!(error = ?e, "{}", context);
             false
         })
+    }
+
+    /// Enforce Z-order for scrolling layouts: focused column on top,
+    /// adjacent columns layered by proximity (left above right at same distance).
+    fn enforce_scrolling_z_order(&self) {
+        for screen in &self.space_manager.screens {
+            let Some(space) = screen.space else { continue };
+            if !self.is_space_active(space) {
+                continue;
+            }
+            let Some(z_order) = self.layout_manager.layout_engine.scrolling_z_order(space) else {
+                continue;
+            };
+            let wsids: Vec<crate::sys::window_server::WindowServerId> = z_order
+                .iter()
+                .filter_map(|wid| {
+                    self.window_manager.windows.get(wid).and_then(|w| w.info.sys_id)
+                })
+                .collect();
+            crate::sys::window_server::order_windows_stack(&wsids);
+        }
     }
 }

@@ -305,6 +305,34 @@ impl ScrollingLayoutSystem {
         self.settings = settings.clone();
     }
 
+    /// Return all windows ordered by desired Z-order (bottom to top).
+    /// Focused column on top, then alternating left/right by proximity
+    /// (left above right at the same distance).
+    pub fn z_ordered_windows(&self, layout: LayoutId) -> Vec<WindowId> {
+        let Some(state) = self.layout_state(layout) else {
+            return Vec::new();
+        };
+        let Some((sel_col, _)) = state.selected_location() else {
+            return Self::all_windows(state);
+        };
+        let num_cols = state.columns.len();
+        let max_dist = sel_col.max(num_cols.saturating_sub(1).saturating_sub(sel_col));
+        let mut ordered = Vec::new();
+        // Furthest first (bottom Z), alternating right then left
+        for dist in (1..=max_dist).rev() {
+            let right = sel_col + dist;
+            if right < num_cols {
+                ordered.extend(state.columns[right].windows.iter());
+            }
+            if dist <= sel_col {
+                ordered.extend(state.columns[sel_col - dist].windows.iter());
+            }
+        }
+        // Focused column last (top Z)
+        ordered.extend(state.columns[sel_col].windows.iter());
+        ordered
+    }
+
     fn clamp_ratio(&self, ratio: f64) -> f64 {
         ratio
             .clamp(

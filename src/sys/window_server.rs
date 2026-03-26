@@ -770,6 +770,26 @@ pub fn resize_cgimage_fit(
     }
 }
 
+/// Order a window above all others in the window server's Z-order.
+/// This uses SLSOrderWindow directly so it works regardless of which app
+/// is frontmost, preventing desktop flicker during cross-app focus changes.
+pub fn order_window_above(wsid: WindowServerId) -> Result<(), CGError> {
+    let cid = *G_CONNECTION;
+    unsafe { cg_ok(SLSOrderWindow(cid, wsid.0, 1 /* kCGSOrderAbove */, 0)) }
+}
+
+/// Order a list of windows in a specific Z-order stack.
+/// The first window in the slice ends up at the bottom, the last on top.
+/// Each window is placed above all others (absolute), so this works across apps.
+pub fn order_windows_stack(wsids: &[WindowServerId]) {
+    let cid = *G_CONNECTION;
+    // Place each window at the absolute top in order. The last one
+    // ends up on top, second-to-last below it, etc.
+    for wsid in wsids {
+        let _ = unsafe { cg_ok(SLSOrderWindow(cid, wsid.0, 1 /* kCGSOrderAbove */, 0)) };
+    }
+}
+
 // credit: https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468
 pub fn make_key_window(pid: pid_t, wsid: WindowServerId) -> Result<(), CGError> {
     #[allow(non_upper_case_globals)]

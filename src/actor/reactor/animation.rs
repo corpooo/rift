@@ -92,6 +92,11 @@ impl<'a> Animation<'a> {
 
             for (&(handle, wid, _, to, _, txid), rect) in self.windows.iter().zip(&next_frames) {
                 let mut rect = *rect;
+                // Round interpolated positions to whole pixels to prevent a
+                // feedback loop: sub-pixel values get rounded by macOS, rift
+                // sees the rounded frame as a change, recalculates layout with
+                // a slightly different result, and the window drifts.
+                rect.origin = rect.origin.round();
                 // Actually don't animate size, too slow. Resize halfway through
                 // and then set the size again at the end, in case it got
                 // clipped during the animation.

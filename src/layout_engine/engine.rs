@@ -476,6 +476,17 @@ impl LayoutEngine {
         }
     }
 
+    /// For scrolling layouts, return window IDs in desired Z-order (bottom to top).
+    /// Returns None for non-scrolling layouts.
+    pub fn scrolling_z_order(&self, space: SpaceId) -> Option<Vec<WindowId>> {
+        let ws_id = self.virtual_workspace_manager.active_workspace(space)?;
+        let layout = self.workspace_layouts.active(space, ws_id)?;
+        match self.workspace_tree(ws_id) {
+            LayoutSystemKind::Scrolling(scrolling) => Some(scrolling.z_ordered_windows(layout)),
+            _ => None,
+        }
+    }
+
     fn active_floating_windows_in_workspace(&self, space: SpaceId) -> Vec<WindowId> {
         self.floating
             .active_flat(space)
