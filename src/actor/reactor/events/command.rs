@@ -52,9 +52,13 @@ impl CommandEventHandler {
             cmd,
             LayoutCommand::NextWorkspace(_)
                 | LayoutCommand::PrevWorkspace(_)
+                | LayoutCommand::MoveWorkspaceLeft
+                | LayoutCommand::MoveWorkspaceRight
                 | LayoutCommand::SwitchToWorkspace(_)
+                | LayoutCommand::MoveWindowToNextWorkspace(_)
+                | LayoutCommand::MoveWindowToPrevWorkspace(_)
                 | LayoutCommand::SetWorkspaceLayout { .. }
-                | LayoutCommand::CreateWorkspace
+                | LayoutCommand::CreateWorkspace { .. }
                 | LayoutCommand::SwitchToLastWorkspace
         );
         let command_space = reactor.workspace_command_space();
@@ -77,9 +81,13 @@ impl CommandEventHandler {
         let response = match &cmd {
             LayoutCommand::NextWorkspace(_)
             | LayoutCommand::PrevWorkspace(_)
+            | LayoutCommand::MoveWorkspaceLeft
+            | LayoutCommand::MoveWorkspaceRight
             | LayoutCommand::SwitchToWorkspace(_)
+            | LayoutCommand::MoveWindowToNextWorkspace(_)
+            | LayoutCommand::MoveWindowToPrevWorkspace(_)
             | LayoutCommand::SetWorkspaceLayout { .. }
-            | LayoutCommand::CreateWorkspace
+            | LayoutCommand::CreateWorkspace { .. }
             | LayoutCommand::SwitchToLastWorkspace => {
                 if let Some(space) = workspace_space {
                     reactor
