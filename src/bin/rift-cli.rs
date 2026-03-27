@@ -58,6 +58,8 @@ enum ServiceCommands {
 
 #[derive(Subcommand)]
 enum QueryCommands {
+    /// Get a workspace overview snapshot for the active display/context
+    Overview,
     /// List virtual workspaces (optionally for a specific MacOS space)
     Workspaces {
         #[arg(long)]
@@ -485,6 +487,7 @@ fn build_request(command: Commands) -> Result<RiftRequest, String> {
 
 fn build_query_request(query: QueryCommands) -> Result<RiftRequest, String> {
     match query {
+        QueryCommands::Overview => Ok(RiftRequest::GetOverview),
         QueryCommands::Workspaces { space_id } => Ok(RiftRequest::GetWorkspaces { space_id }),
         QueryCommands::Windows { space_id } => Ok(RiftRequest::GetWindows { space_id }),
         QueryCommands::Displays => Ok(RiftRequest::GetDisplays),

@@ -19,7 +19,7 @@ use rift_wm::actor::window_notify as window_notify_actor;
 use rift_wm::actor::wm_controller::{self, WmController};
 use rift_wm::common::config::{Config, config_file, restore_file};
 use rift_wm::common::log;
-use rift_wm::common::util::execute_startup_commands;
+use rift_wm::common::util::{execute_startup_commands, launch_ui_client_if_available};
 use rift_wm::ipc;
 use rift_wm::layout_engine::LayoutEngine;
 use rift_wm::model::tx_store::WindowTxStore;
@@ -219,6 +219,8 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             }
         }
     });
+
+    launch_ui_client_if_available();
 
     let wm_config = wm_controller::Config {
         restore_file: restore_file(),

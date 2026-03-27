@@ -10,6 +10,13 @@ use crate::sys::screen::{ScreenId, ScreenInfo, SpaceId};
 use crate::sys::window_server::WindowServerId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverviewData {
+    pub generated_at_ms: u64,
+    pub current_display: Option<DisplayData>,
+    pub workspaces: Vec<WorkspaceData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceData {
     pub id: String,
     pub index: usize,
@@ -300,5 +307,40 @@ mod tests {
             "inactive_space_ids": [43, 44],
         });
         assert_eq!(value, expected);
+    }
+
+    #[test]
+    fn overview_data_serializes() {
+        let info = ScreenInfo {
+            id: ScreenId::new(1),
+            frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(100.0, 100.0)),
+            display_uuid: "display-1".to_string(),
+            name: Some("Studio Display".to_string()),
+            space: Some(SpaceId::new(9)),
+        };
+        let overview = OverviewData {
+            generated_at_ms: 42,
+            current_display: Some(DisplayData {
+                info,
+                is_active_space: true,
+                is_active_context: true,
+                active_space_ids: vec![9],
+                inactive_space_ids: vec![10],
+            }),
+            workspaces: vec![WorkspaceData {
+                id: "VirtualWorkspaceId(1v1)".to_string(),
+                index: 0,
+                name: "Code".to_string(),
+                layout_mode: "scrolling".to_string(),
+                is_active: true,
+                window_count: 0,
+                windows: vec![],
+            }],
+        };
+
+        let value = serde_json::to_value(&overview).expect("serialize OverviewData");
+        assert_eq!(value["generated_at_ms"], json!(42));
+        assert_eq!(value["current_display"]["name"], json!("Studio Display"));
+        assert_eq!(value["workspaces"][0]["name"], json!("Code"));
     }
 }

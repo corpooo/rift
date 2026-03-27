@@ -5,6 +5,7 @@ use serde_json::Value;
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum RiftRequest {
+    GetOverview,
     GetWorkspaces {
         space_id: Option<u64>,
     },

@@ -1,0 +1,44 @@
+name: RiftUI
+options:
+  createIntermediateGroups: true
+  derivedDataPath: DerivedData
+packages:
+  RiftUIPackages:
+    path: .
+targets:
+  RiftUI:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - App/Sources
+      - path: App/Resources
+        buildPhase: resources
+        excludes:
+          - Info.plist
+    info:
+      path: App/Resources/Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: "org.riftwm.ui"
+        PRODUCT_NAME: "Rift UI"
+        DEVELOPMENT_TEAM: "Y9UG364Y8G"
+        SWIFT_VERSION: "6.1"
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 0.1.0
+      configs:
+        Debug:
+          PRODUCT_BUNDLE_IDENTIFIER: "org.riftwm.ui.debug"
+          PRODUCT_NAME: "Rift UI Debug"
+          INFOPLIST_KEY_CFBundleDisplayName: "Rift UI Debug"
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_IDENTITY: Apple Development
+        Release:
+          PRODUCT_BUNDLE_IDENTIFIER: "org.riftwm.ui"
+          PRODUCT_NAME: "Rift UI"
+          INFOPLIST_KEY_CFBundleDisplayName: "Rift UI"
+          CODE_SIGN_STYLE: Automatic
+          CODE_SIGN_IDENTITY: Apple Development
+    dependencies:
+      - package: RiftUIPackages
+        product: RiftUICore

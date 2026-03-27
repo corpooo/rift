@@ -1,4 +1,9 @@
-use tracing::{error, trace};
+use std::env;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use tracing::{error, info, trace, warn};
 
 pub fn parse_command(command: &str) -> Vec<String> {
     let mut parts = Vec::new();
@@ -97,4 +102,105 @@ pub fn execute_startup_commands(commands: &[String]) {
             }
         });
     }
+}
+
+pub fn launch_ui_client_if_available() {
+    if env_flag_is_false("RIFT_UI_AUTOLAUNCH") {
+        trace!("Skipping UI auto-launch because RIFT_UI_AUTOLAUNCH is disabled");
+        return;
+    }
+
+    if rift_ui_is_running() {
+        trace!("Skipping UI auto-launch because RiftUI is already running");
+        return;
+    }
+
+    let Some(target) = resolve_ui_client_target() else {
+        trace!("No Rift UI client target found for auto-launch");
+        return;
+    };
+
+    std::thread::spawn(move || match launch_ui_target(&target) {
+        Ok(()) => info!("Launched Rift UI client: {}", target.display()),
+        Err(err) => warn!("Failed to auto-launch Rift UI client '{}': {}", target.display(), err),
+    });
+}
+
+fn env_flag_is_false(name: &str) -> bool {
+    matches!(
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
+
+fn rift_ui_is_running() -> bool {
+    Command::new("/usr/bin/pgrep")
+        .args(["-x", "RiftUI"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn resolve_ui_client_target() -> Option<PathBuf> {
+    if let Some(explicit) = env::var_os("RIFT_UI_PATH") {
+        let path = PathBuf::from(explicit);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    let mut search_roots = Vec::new();
+    search_roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    if let Ok(current_exe) = env::current_exe() {
+        let mut current = current_exe.parent().map(Path::to_path_buf);
+        while let Some(dir) = current {
+            if !search_roots.contains(&dir) {
+                search_roots.push(dir.clone());
+            }
+            current = dir.parent().map(Path::to_path_buf);
+        }
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        search_roots.push(home.clone());
+        search_roots.push(home.join("Applications"));
+    }
+    search_roots.push(PathBuf::from("/Applications"));
+
+    for root in search_roots {
+        for suffix in [
+            PathBuf::from("swift-client/RiftUI/.build/arm64-apple-macosx/debug/RiftUI"),
+            PathBuf::from("swift-client/RiftUI/.build/debug/RiftUI"),
+            PathBuf::from("Applications/RiftUI.app"),
+            PathBuf::from("Applications/Rift UI.app"),
+            PathBuf::from("RiftUI.app"),
+            PathBuf::from("Rift UI.app"),
+        ] {
+            let candidate = root.join(&suffix);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
+fn launch_ui_target(target: &Path) -> std::io::Result<()> {
+    if target.extension() == Some(OsStr::new("app")) {
+        Command::new("/usr/bin/open")
+            .args(["-g", target.to_string_lossy().as_ref()])
+            .spawn()?;
+        return Ok(());
+    }
+
+    Command::new(target)
+        .env("RIFT_UI_AUTOLAUNCH", "0")
+        .env("RIFT_UI_AUTOLAUNCHED", "1")
+        .spawn()?;
+    Ok(())
 }

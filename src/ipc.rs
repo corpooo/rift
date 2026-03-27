@@ -1,5 +1,6 @@
 use std::ffi::{CStr, c_char};
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use r#continue::continuation;
 use tracing::{error, info, trace};
@@ -13,6 +14,7 @@ pub use protocol::{RiftCommand, RiftRequest, RiftResponse};
 use crate::actor::config as config_actor;
 use crate::actor::reactor::{self, Event};
 use crate::ipc::subscriptions::SharedServerState;
+use crate::model::server::OverviewData;
 use crate::sys::dispatch::block_on;
 use crate::sys::mach::{
     is_mach_server_registered, mach_allocate_reply_port, mach_deallocate_reply_port,
@@ -222,6 +224,31 @@ impl MachHandler {
         trace!("Handling request: {:?} from client {}", request, client_port);
 
         match request {
+            RiftRequest::GetOverview => {
+                let displays = self.reactor.query_displays();
+                let current_display = displays
+                    .iter()
+                    .find(|display| display.is_active_context)
+                    .cloned()
+                    .or_else(|| displays.iter().find(|display| display.is_active_space).cloned())
+                    .or_else(|| displays.first().cloned());
+                let workspaces = self
+                    .reactor
+                    .query_workspaces(current_display.as_ref().and_then(|display| display.info.space));
+
+                let overview = OverviewData {
+                    generated_at_ms: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    current_display,
+                    workspaces,
+                };
+
+                RiftResponse::Success {
+                    data: serde_json::to_value(overview).unwrap(),
+                }
+            }
             RiftRequest::Subscribe { event } => {
                 let state = self.server_state.read();
                 state.subscribe_client(client_port, event.clone());
