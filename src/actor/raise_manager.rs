@@ -617,7 +617,6 @@ mod tests {
                 "expected latest regular raise request, got {requests:?}"
             );
 
-            // Complete second sequence's regular raise
             raise_manager.handle_message(Event::RaiseCompleted {
                 window_id: WindowId::new(1, 3),
                 sequence_id: 2,
