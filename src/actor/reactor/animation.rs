@@ -1,10 +1,11 @@
 use std::time::{Duration, Instant};
+use std::sync::mpsc;
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use tracing::{debug, trace};
 
 use super::TransactionId;
-use crate::actor::app::{AppThreadHandle, Request, WindowId, pid_t};
+use crate::actor::app::{AppThreadHandle, Request, SynchronizedAnimationBatch, WindowId, pid_t};
 use crate::actor::reactor::Reactor;
 use crate::common::collections::HashMap;
 use crate::common::config::{AnimationEasing, LayoutMode};
@@ -75,35 +76,43 @@ impl<'a> Animation<'a> {
 
         let start = Instant::now();
         let duration_secs = self.duration.as_secs_f64();
+        let fps = self.effective_fps();
+        let frame_count = if duration_secs == 0.0 {
+            1
+        } else {
+            (duration_secs * fps).round().max(1.0) as u32
+        };
         let mut next_frames = Vec::with_capacity(self.windows.len());
         let mut sent_mid_resize = false;
 
-        loop {
-            let elapsed = start.elapsed();
-            if elapsed < self.duration {
-                let fps = self.effective_fps();
-                let interval = Duration::from_secs_f64(1.0 / fps);
-                std::thread::sleep(interval.min(self.duration - elapsed));
+        for frame_idx in 1..=frame_count {
+            let t = f64::from(frame_idx) / f64::from(frame_count);
+            let deadline = start + Duration::from_secs_f64(duration_secs * t);
+            match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) => std::thread::sleep(remaining),
+                // Keep the overall animation duration bounded when AX writes
+                // are slow by dropping overdue intermediate frames. The final
+                // frame is still delivered so we always land on the target.
+                None if frame_idx != frame_count => continue,
+                None => {}
             }
 
-            let t = if duration_secs == 0.0 {
-                1.0
-            } else {
-                (start.elapsed().as_secs_f64() / duration_secs).min(1.0)
-            };
-            let is_final = t >= 1.0;
-            let should_resize = is_final || (!sent_mid_resize && t >= 0.5);
+            let is_final = frame_idx == frame_count;
+            let should_resize = is_final || (!sent_mid_resize && frame_idx * 2 >= frame_count);
 
             next_frames.clear();
             for (_, _, from, to, _, _) in &self.windows {
                 next_frames.push(get_frame(*from, *to, t));
             }
 
-            let mut frames_by_pid: HashMap<pid_t, (&AppThreadHandle, TransactionId, Vec<(WindowId, CGRect)>)> =
-                HashMap::default();
-            let mut positions_by_pid: HashMap<
+            let mut batches_by_pid: HashMap<
                 pid_t,
-                (&AppThreadHandle, TransactionId, Vec<(WindowId, CGPoint)>),
+                (
+                    &AppThreadHandle,
+                    TransactionId,
+                    Vec<(WindowId, CGRect)>,
+                    Vec<(WindowId, CGPoint)>,
+                ),
             > = HashMap::default();
 
             for (&(handle, wid, from, to, _, txid), rect) in self.windows.iter().zip(&next_frames)
@@ -117,42 +126,54 @@ impl<'a> Animation<'a> {
                 // Actually don't animate size, too slow. Resize halfway through
                 // and then set the size again at the end, in case it got
                 // clipped during the animation.
+                let entry = batches_by_pid
+                    .entry(wid.pid)
+                    .or_insert((handle, txid, Vec::new(), Vec::new()));
                 if should_resize && size_changed(from, to) {
                     rect.size = to.size;
-                    let entry = frames_by_pid
-                        .entry(wid.pid)
-                        .or_insert((handle, txid, Vec::new()));
                     entry.2.push((wid, rect));
                 } else {
-                    let entry = positions_by_pid
-                        .entry(wid.pid)
-                        .or_insert((handle, txid, Vec::new()));
-                    entry.2.push((wid, rect.origin));
+                    entry.3.push((wid, rect.origin));
                 }
             }
 
-            for (_, (handle, txid, frames)) in frames_by_pid {
-                if frames.len() == 1 {
-                    let (wid, rect) = frames.into_iter().next().unwrap();
-                    _ = handle.send(Request::SetWindowFrame(wid, rect, txid, false));
-                } else {
-                    _ = handle.send(Request::SetBatchWindowFrame(frames, txid));
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let mut release_txs = Vec::new();
+            let mut dispatched = 0usize;
+
+            for (_, (handle, txid, frames, positions)) in batches_by_pid {
+                let (release_tx, release_rx) = mpsc::channel();
+                let request = Request::RunSynchronizedAnimationBatch(SynchronizedAnimationBatch {
+                    txid,
+                    frames,
+                    positions,
+                    ready_tx: ready_tx.clone(),
+                    release_rx,
+                    done_tx: done_tx.clone(),
+                });
+                if handle.send(request).is_ok() {
+                    release_txs.push(release_tx);
+                    dispatched += 1;
                 }
             }
-            for (_, (handle, txid, positions)) in positions_by_pid {
-                if positions.len() == 1 {
-                    let (wid, pos) = positions.into_iter().next().unwrap();
-                    _ = handle.send(Request::SetWindowPos(wid, pos, txid, false));
-                } else {
-                    _ = handle.send(Request::SetBatchWindowPos(positions, txid));
+
+            for _ in 0..dispatched {
+                if ready_rx.recv().is_err() {
+                    break;
+                }
+            }
+            for release_tx in release_txs {
+                let _ = release_tx.send(());
+            }
+            for _ in 0..dispatched {
+                if done_rx.recv().is_err() {
+                    break;
                 }
             }
 
             if should_resize && !is_final {
                 sent_mid_resize = true;
-            }
-            if is_final {
-                break;
             }
         }
 
@@ -171,8 +192,56 @@ impl<'a> Animation<'a> {
 
     #[allow(dead_code)]
     pub fn skip_to_end(self) {
+        let mut batches_by_pid: HashMap<
+            pid_t,
+            (
+                &AppThreadHandle,
+                TransactionId,
+                Vec<(WindowId, CGRect)>,
+                Vec<(WindowId, CGPoint)>,
+            ),
+        > = HashMap::default();
+
         for &(handle, wid, _from, to, _, txid) in &self.windows {
-            _ = handle.send(Request::SetWindowFrame(wid, to, txid, true));
+            let entry = batches_by_pid
+                .entry(wid.pid)
+                .or_insert((handle, txid, Vec::new(), Vec::new()));
+            entry.2.push((wid, to));
+        }
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut release_txs = Vec::new();
+        let mut dispatched = 0usize;
+
+        for (_, (handle, txid, frames, positions)) in batches_by_pid {
+            let (release_tx, release_rx) = mpsc::channel();
+            let request = Request::RunSynchronizedAnimationBatch(SynchronizedAnimationBatch {
+                txid,
+                frames,
+                positions,
+                ready_tx: ready_tx.clone(),
+                release_rx,
+                done_tx: done_tx.clone(),
+            });
+            if handle.send(request).is_ok() {
+                release_txs.push(release_tx);
+                dispatched += 1;
+            }
+        }
+
+        for _ in 0..dispatched {
+            if ready_rx.recv().is_err() {
+                break;
+            }
+        }
+        for release_tx in release_txs {
+            let _ = release_tx.send(());
+        }
+        for _ in 0..dispatched {
+            if done_rx.recv().is_err() {
+                break;
+            }
         }
     }
 }
@@ -375,7 +444,8 @@ impl AnimationManager {
         layout: &[(WindowId, CGRect)],
         skip_wid: Option<WindowId>,
     ) -> bool {
-        let mut per_app: HashMap<pid_t, Vec<(WindowId, CGRect)>> = HashMap::default();
+        let mut per_app: HashMap<pid_t, (AppThreadHandle, Vec<(WindowId, CGRect)>)> =
+            HashMap::default();
         let mut any_frame_changed = false;
 
         for &(wid, target_frame) in layout {
@@ -412,20 +482,26 @@ impl AnimationManager {
                 "Instant workspace positioning"
             );
 
-            per_app.entry(wid.pid).or_default().push((wid, target_frame));
+            let Some(app_state) = reactor.app_manager.apps.get(&wid.pid) else {
+                debug!(?wid, "Skipping layout update for app - app no longer exists");
+                continue;
+            };
+            per_app
+                .entry(wid.pid)
+                .or_insert_with(|| (app_state.handle.clone(), Vec::new()))
+                .1
+                .push((wid, target_frame));
         }
 
-        for (pid, frames) in per_app.into_iter() {
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut release_txs = Vec::new();
+        let mut dispatched = 0usize;
+
+        for (pid, (handle, frames)) in per_app.into_iter() {
             if frames.is_empty() {
                 continue;
             }
-
-            let Some(app_state) = reactor.app_manager.apps.get(&pid) else {
-                debug!(?pid, "Skipping layout update for app - app no longer exists");
-                continue;
-            };
-
-            let handle = app_state.handle.clone();
 
             let (first_wid, first_target) = frames[0];
             let mut txid = TransactionId::default();
@@ -451,8 +527,16 @@ impl AnimationManager {
                 reactor.transaction_manager.update_txid_entries(txid_entries);
             }
 
-            let frames_to_send = frames.clone();
-            if let Err(e) = handle.send(Request::SetBatchWindowFrame(frames_to_send, txid)) {
+            let (release_tx, release_rx) = mpsc::channel();
+            let request = Request::RunSynchronizedAnimationBatch(SynchronizedAnimationBatch {
+                txid,
+                frames: frames.clone(),
+                positions: Vec::new(),
+                ready_tx: ready_tx.clone(),
+                release_rx,
+                done_tx: done_tx.clone(),
+            });
+            if let Err(e) = handle.send(request) {
                 debug!(
                     ?pid,
                     ?e,
@@ -460,11 +544,27 @@ impl AnimationManager {
                 );
                 continue;
             }
+            release_txs.push(release_tx);
+            dispatched += 1;
 
             for (wid, target_frame) in &frames {
                 if let Some(window) = reactor.window_manager.windows.get_mut(wid) {
                     window.frame_monotonic = *target_frame;
                 }
+            }
+        }
+
+        for _ in 0..dispatched {
+            if ready_rx.recv().is_err() {
+                break;
+            }
+        }
+        for release_tx in release_txs {
+            let _ = release_tx.send(());
+        }
+        for _ in 0..dispatched {
+            if done_rx.recv().is_err() {
+                break;
             }
         }
 

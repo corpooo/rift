@@ -288,6 +288,44 @@ impl Apps {
                         ));
                     }
                 }
+                Request::RunSynchronizedAnimationBatch(batch) => {
+                    let _ = batch.ready_tx.send(());
+                    let _ = batch.release_rx.recv();
+
+                    for (wid, frame) in batch.frames {
+                        let window = self.windows.entry(wid).or_default();
+                        window.last_seen_txid = batch.txid;
+                        let old_frame = window.frame;
+                        window.frame = frame;
+                        if !window.animating && !old_frame.same_as(frame) {
+                            events.push(Event::WindowFrameChanged(
+                                wid,
+                                frame,
+                                Some(batch.txid),
+                                Requested(true),
+                                None,
+                            ));
+                        }
+                    }
+
+                    for (wid, pos) in batch.positions {
+                        let window = self.windows.entry(wid).or_default();
+                        window.last_seen_txid = batch.txid;
+                        let old_frame = window.frame;
+                        window.frame.origin = pos;
+                        if !window.animating && !old_frame.same_as(window.frame) {
+                            events.push(Event::WindowFrameChanged(
+                                wid,
+                                window.frame,
+                                Some(batch.txid),
+                                Requested(true),
+                                None,
+                            ));
+                        }
+                    }
+
+                    let _ = batch.done_tx.send(());
+                }
                 Request::BeginWindowAnimation(wid) => {
                     self.windows.entry(wid).or_default().animating = true;
                 }

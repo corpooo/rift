@@ -7,6 +7,9 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::num::NonZeroU32;
+use std::sync::mpsc::{
+    Receiver as BlockingReceiver, RecvError, Sender as BlockingSender,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -222,6 +225,25 @@ impl Debug for AppThreadHandle {
     }
 }
 
+pub struct SynchronizedAnimationBatch {
+    pub txid: TransactionId,
+    pub frames: Vec<(WindowId, CGRect)>,
+    pub positions: Vec<(WindowId, CGPoint)>,
+    pub ready_tx: BlockingSender<()>,
+    pub release_rx: BlockingReceiver<()>,
+    pub done_tx: BlockingSender<()>,
+}
+
+impl Debug for SynchronizedAnimationBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SynchronizedAnimationBatch")
+            .field("txid", &self.txid)
+            .field("frame_count", &self.frames.len())
+            .field("position_count", &self.positions.len())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub enum Request {
     Terminate,
@@ -233,6 +255,7 @@ pub enum Request {
     SetBatchWindowFrame(Vec<(WindowId, CGRect)>, TransactionId),
     SetBatchWindowPos(Vec<(WindowId, CGPoint)>, TransactionId),
     SetWindowPos(WindowId, CGPoint, TransactionId, bool),
+    RunSynchronizedAnimationBatch(SynchronizedAnimationBatch),
 
     BeginWindowAnimation(WindowId),
     EndWindowAnimation(WindowId),
@@ -318,6 +341,118 @@ const WINDOW_ANIMATION_NOTIFICATIONS: &[&str] =
     &[kAXWindowMovedNotification, kAXWindowResizedNotification];
 
 impl State {
+    fn apply_batch_window_frames(
+        &mut self,
+        frames: &[(WindowId, CGRect)],
+        txid: TransactionId,
+    ) -> Result<(), AxError> {
+        let app = self.app.clone();
+        with_enhanced_ui_disabled(&app, || -> Result<(), AxError> {
+            for (wid, desired) in frames.iter() {
+                let (elem, is_animating) = match self.window_mut(*wid) {
+                    Ok(window) => {
+                        window.last_seen_txid = txid;
+                        window.cached_frame = *desired;
+                        (window.elem.clone(), window.is_animating)
+                    }
+                    Err(err) => match err {
+                        AxError::Ax(code) => {
+                            if self.handle_ax_error(*wid, &code) {
+                                continue;
+                            }
+                            return Err(AxError::Ax(code));
+                        }
+                        AxError::NotFound => continue,
+                    },
+                };
+
+                let write_started = Instant::now();
+                let _ = elem.set_size(desired.size);
+                let _ = elem.set_position(desired.origin);
+                let _ = elem.set_size(desired.size);
+                if is_animating {
+                    self.record_animation_write(write_started.elapsed());
+                }
+
+                let frame = if is_animating {
+                    *desired
+                } else {
+                    match self.handle_ax_result(*wid, elem.frame())? {
+                        Some(frame) => frame,
+                        None => continue,
+                    }
+                };
+                if let Ok(window) = self.window_mut(*wid) {
+                    window.cached_frame = frame;
+                }
+
+                self.send_event(Event::WindowFrameChanged(
+                    *wid,
+                    frame,
+                    Some(txid),
+                    Requested(true),
+                    None,
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn apply_batch_window_positions(
+        &mut self,
+        positions: &[(WindowId, CGPoint)],
+        txid: TransactionId,
+    ) -> Result<(), AxError> {
+        let app = self.app.clone();
+        with_enhanced_ui_disabled(&app, || -> Result<(), AxError> {
+            for (wid, pos) in positions.iter() {
+                let (elem, is_animating, frame) = match self.window_mut(*wid) {
+                    Ok(window) => {
+                        window.last_seen_txid = txid;
+                        window.cached_frame.origin = *pos;
+                        (window.elem.clone(), window.is_animating, window.cached_frame)
+                    }
+                    Err(err) => match err {
+                        AxError::Ax(code) => {
+                            if self.handle_ax_error(*wid, &code) {
+                                continue;
+                            }
+                            return Err(AxError::Ax(code));
+                        }
+                        AxError::NotFound => continue,
+                    },
+                };
+
+                let write_started = Instant::now();
+                let _ = elem.set_position(*pos);
+                if is_animating {
+                    self.record_animation_write(write_started.elapsed());
+                }
+
+                let frame = if is_animating {
+                    frame
+                } else {
+                    match self.handle_ax_result(*wid, elem.frame())? {
+                        Some(frame) => frame,
+                        None => continue,
+                    }
+                };
+                if let Ok(window) = self.window_mut(*wid) {
+                    window.cached_frame = frame;
+                }
+
+                self.send_event(Event::WindowFrameChanged(
+                    *wid,
+                    frame,
+                    Some(txid),
+                    Requested(true),
+                    None,
+                ));
+            }
+            Ok(())
+        })
+    }
+
     fn record_animation_write(&self, duration: Duration) {
         let sample = duration.as_micros().max(1) as u64;
         let old = self.animation_write_micros.load(Ordering::Relaxed);
@@ -766,109 +901,29 @@ impl State {
                 ));
             }
             &mut Request::SetBatchWindowFrame(ref mut frames, txid) => {
-                let app = self.app.clone();
-                let result = with_enhanced_ui_disabled(&app, || -> Result<(), AxError> {
-                    for (wid, desired) in frames.iter() {
-                        let (elem, is_animating) = match self.window_mut(*wid) {
-                            Ok(window) => {
-                                window.last_seen_txid = txid;
-                                window.cached_frame = *desired;
-                                (window.elem.clone(), window.is_animating)
-                            }
-                            Err(err) => match err {
-                                AxError::Ax(code) => {
-                                    if self.handle_ax_error(*wid, &code) {
-                                        continue;
-                                    }
-                                    return Err(AxError::Ax(code));
-                                }
-                                AxError::NotFound => continue,
-                            },
-                        };
-
-                        let write_started = Instant::now();
-                        let _ = elem.set_size(desired.size);
-                        let _ = elem.set_position(desired.origin);
-                        let _ = elem.set_size(desired.size);
-                        if is_animating {
-                            self.record_animation_write(write_started.elapsed());
-                        }
-
-                        let frame = if is_animating {
-                            *desired
-                        } else {
-                            match self.handle_ax_result(*wid, elem.frame())? {
-                                Some(frame) => frame,
-                                None => continue,
-                            }
-                        };
-                        if let Ok(window) = self.window_mut(*wid) {
-                            window.cached_frame = frame;
-                        }
-
-                        self.send_event(Event::WindowFrameChanged(
-                            *wid,
-                            frame,
-                            Some(txid),
-                            Requested(true),
-                            None,
-                        ));
-                    }
-                    Ok(())
-                });
-                if let Err(err) = result {
-                    return Err(err);
-                }
+                self.apply_batch_window_frames(frames.as_slice(), txid)?;
             }
             &mut Request::SetBatchWindowPos(ref mut positions, txid) => {
-                let app = self.app.clone();
-                let result = with_enhanced_ui_disabled(&app, || -> Result<(), AxError> {
-                    for (wid, pos) in positions.iter() {
-                        let (elem, is_animating, frame) = match self.window_mut(*wid) {
-                            Ok(window) => {
-                                window.last_seen_txid = txid;
-                                window.cached_frame.origin = *pos;
-                                (window.elem.clone(), window.is_animating, window.cached_frame)
-                            }
-                            Err(err) => match err {
-                                AxError::Ax(code) => {
-                                    if self.handle_ax_error(*wid, &code) {
-                                        continue;
-                                    }
-                                    return Err(AxError::Ax(code));
-                                }
-                                AxError::NotFound => continue,
-                            },
-                        };
-
-                        let write_started = Instant::now();
-                        let _ = elem.set_position(*pos);
-                        if is_animating {
-                            self.record_animation_write(write_started.elapsed());
-                        }
-
-                        let frame = if is_animating {
-                            frame
-                        } else {
-                            match self.handle_ax_result(*wid, elem.frame())? {
-                                Some(frame) => frame,
-                                None => continue,
-                            }
-                        };
-                        if let Ok(window) = self.window_mut(*wid) {
-                            window.cached_frame = frame;
-                        }
-
-                        self.send_event(Event::WindowFrameChanged(
-                            *wid,
-                            frame,
-                            Some(txid),
-                            Requested(true),
-                            None,
-                        ));
+                self.apply_batch_window_positions(positions.as_slice(), txid)?;
+            }
+            Request::RunSynchronizedAnimationBatch(batch) => {
+                let txid = batch.txid;
+                let frames = std::mem::take(&mut batch.frames);
+                let positions = std::mem::take(&mut batch.positions);
+                let ready_tx = batch.ready_tx.clone();
+                let done_tx = batch.done_tx.clone();
+                let release_result = {
+                    let _ = ready_tx.send(());
+                    batch.release_rx.recv()
+                };
+                let result = match release_result {
+                    Ok(()) => {
+                        self.apply_batch_window_frames(&frames, txid)?;
+                        self.apply_batch_window_positions(&positions, txid)
                     }
-                    Ok(())
-                });
+                    Err(RecvError) => Ok(()),
+                };
+                let _ = done_tx.send(());
                 if let Err(err) = result {
                     return Err(err);
                 }
