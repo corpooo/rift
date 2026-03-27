@@ -1098,11 +1098,23 @@ impl LayoutSystem for ScrollingLayoutSystem {
                     current_iter.next();
                 }
                 (Some(des), None) => {
-                    state.insert_column_at_end(**des);
+                    if let Some((col_idx, _)) = state.selected_location() {
+                        state.insert_column_after(col_idx, **des);
+                    } else if !state.columns.is_empty() {
+                        state.insert_column_after(0, **des);
+                    } else {
+                        state.insert_column_at_end(**des);
+                    }
                     desired_iter.next();
                 }
                 (Some(des), Some(cur)) if des < cur => {
-                    state.insert_column_at_end(**des);
+                    if let Some((col_idx, _)) = state.selected_location() {
+                        state.insert_column_after(col_idx, **des);
+                    } else if !state.columns.is_empty() {
+                        state.insert_column_after(0, **des);
+                    } else {
+                        state.insert_column_at_end(**des);
+                    }
                     desired_iter.next();
                 }
                 (_, Some(cur)) => {
@@ -1855,6 +1867,31 @@ mod tests {
         assert_eq!(state.columns.len(), 3);
         assert_eq!(state.columns[1].windows, vec![w3]);
         assert_eq!(state.columns[2].windows, vec![w2]);
+    }
+
+    #[test]
+    fn syncing_new_app_windows_inserts_after_current_selection() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(60, 1);
+        let w2 = wid(60, 2);
+        let w3 = wid(60, 3);
+        let new_app_window = wid(61, 1);
+
+        system.add_window_after_selection(layout, w1);
+        system.add_window_after_selection(layout, w2);
+        system.add_window_after_selection(layout, w3);
+        let _ = system.select_window(layout, w1);
+
+        system.set_windows_for_app(layout, new_app_window.pid, vec![new_app_window]);
+
+        let state = system.layouts.get(layout).expect("layout state missing");
+        assert_eq!(state.columns.len(), 4);
+        assert_eq!(state.columns[0].windows, vec![w1]);
+        assert_eq!(state.columns[1].windows, vec![new_app_window]);
+        assert_eq!(state.columns[2].windows, vec![w2]);
+        assert_eq!(state.columns[3].windows, vec![w3]);
+        assert_eq!(state.selected, Some(new_app_window));
     }
 
     #[test]
