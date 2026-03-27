@@ -1074,9 +1074,13 @@ impl State {
             .and_then(|(_, space)| self.layout_mode_by_space.get(space).copied())
     }
 
-    fn note_key_down(&mut self, key_code: KeyCode) { self.pressed_keys.insert(key_code); }
+    fn note_key_down(&mut self, key_code: KeyCode) {
+        self.pressed_keys.insert(key_code);
+    }
 
-    fn note_key_up(&mut self, key_code: KeyCode) { self.pressed_keys.remove(&key_code); }
+    fn note_key_up(&mut self, key_code: KeyCode) {
+        self.pressed_keys.remove(&key_code);
+    }
 
     fn note_flags_changed(&mut self, key_code: KeyCode) {
         if is_modifier_key(key_code) {
@@ -1225,10 +1229,13 @@ impl State {
 
         let level =
             trace_misc("window_level", || window_level(id.into())).unwrap_or(NSWindowLevel::MIN);
-        self.window_level_cache.insert(id, CachedWindowLevel {
-            level,
-            observed_at: event_timestamp,
-        });
+        self.window_level_cache.insert(
+            id,
+            CachedWindowLevel {
+                level,
+                observed_at: event_timestamp,
+            },
+        );
         level
     }
 }

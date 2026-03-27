@@ -97,7 +97,9 @@ pub fn make_window(idx: usize) -> WindowInfo {
     }
 }
 
-pub fn make_windows(count: usize) -> Vec<WindowInfo> { (1..=count).map(make_window).collect() }
+pub fn make_windows(count: usize) -> Vec<WindowInfo> {
+    (1..=count).map(make_window).collect()
+}
 
 pub struct Apps {
     tx: actor::Sender<Request>,
@@ -137,10 +139,13 @@ impl Apps {
         with_ws_info: bool,
     ) -> Vec<Event> {
         for (id, info) in (1..).map(|idx| WindowId::new(pid, idx)).zip(&windows) {
-            self.windows.insert(id, TestWindowState {
-                frame: info.frame,
-                ..Default::default()
-            });
+            self.windows.insert(
+                id,
+                TestWindowState {
+                    frame: info.frame,
+                    ..Default::default()
+                },
+            );
         }
         let handle = AppThreadHandle::new_for_test(self.tx.clone());
         vec![Event::ApplicationLaunched {
@@ -244,6 +249,23 @@ impl Apps {
                             events.push(Event::WindowFrameChanged(
                                 wid,
                                 frame,
+                                Some(txid),
+                                Requested(true),
+                                None,
+                            ));
+                        }
+                    }
+                }
+                Request::SetBatchWindowPos(positions, txid) => {
+                    for (wid, pos) in positions {
+                        let window = self.windows.entry(wid).or_default();
+                        window.last_seen_txid = txid;
+                        let old_frame = window.frame;
+                        window.frame.origin = pos;
+                        if !window.animating && !old_frame.same_as(window.frame) {
+                            events.push(Event::WindowFrameChanged(
+                                wid,
+                                window.frame,
                                 Some(txid),
                                 Requested(true),
                                 None,

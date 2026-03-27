@@ -81,11 +81,17 @@ pub struct ReactorHandle {
 }
 
 impl ReactorHandle {
-    pub fn new(sender: Sender, queries: ReactorQueryHandle) -> Self { Self { sender, queries } }
+    pub fn new(sender: Sender, queries: ReactorQueryHandle) -> Self {
+        Self { sender, queries }
+    }
 
-    pub fn sender(&self) -> Sender { self.sender.clone() }
+    pub fn sender(&self) -> Sender {
+        self.sender.clone()
+    }
 
-    pub fn send(&self, event: Event) { self.sender.send(event) }
+    pub fn send(&self, event: Event) {
+        self.sender.send(event)
+    }
 
     pub fn try_send(
         &self,
@@ -98,7 +104,9 @@ impl ReactorHandle {
 impl std::ops::Deref for ReactorHandle {
     type Target = ReactorQueryHandle;
 
-    fn deref(&self) -> &Self::Target { &self.queries }
+    fn deref(&self) -> &Self::Target {
+        &self.queries
+    }
 }
 
 use display_topology::{DisplaySnapshot, DisplayTopologyManager, WindowSnapshot};
@@ -385,7 +393,9 @@ impl Reactor {
         }
     }
 
-    fn is_space_active(&self, space: SpaceId) -> bool { self.active_spaces.contains(&space) }
+    fn is_space_active(&self, space: SpaceId) -> bool {
+        self.active_spaces.contains(&space)
+    }
 
     fn iter_active_spaces(&self) -> impl Iterator<Item = SpaceId> + '_ {
         self.active_spaces.iter().copied()
@@ -407,7 +417,9 @@ impl Reactor {
         }
     }
 
-    fn screens_for_current_spaces(&self) -> Vec<ScreenInfo> { self.space_manager.screens.clone() }
+    fn screens_for_current_spaces(&self) -> Vec<ScreenInfo> {
+        self.space_manager.screens.clone()
+    }
 
     fn screens_for_spaces(&self, spaces: &[Option<SpaceId>]) -> Vec<ScreenInfo> {
         self.space_manager
@@ -929,7 +941,18 @@ impl Reactor {
 
         let raised_window = self.main_window_tracker.handle_event(&event);
         let mut is_resize = false;
+        let mut should_update_layout = true;
         let mut window_was_destroyed = false;
+        let force_instant_layout = matches!(
+            &event,
+            Event::ApplicationLaunched { .. }
+                | Event::ApplicationActivated(..)
+                | Event::ApplicationMainWindowChanged(..)
+                | Event::WindowsDiscovered { .. }
+                | Event::WindowCreated(..)
+                | Event::ScreenParametersChanged(..)
+                | Event::SpaceChanged(..)
+        );
 
         match event {
             Event::ApplicationLaunched {
@@ -1022,7 +1045,7 @@ impl Reactor {
                 WindowEventHandler::handle_window_deminiaturized(self, wid);
             }
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
-                is_resize = WindowEventHandler::handle_window_frame_changed(
+                let outcome = WindowEventHandler::handle_window_frame_changed(
                     self,
                     wid,
                     new_frame,
@@ -1030,6 +1053,8 @@ impl Reactor {
                     requested,
                     mouse_state,
                 );
+                is_resize = outcome.is_resize;
+                should_update_layout = outcome.should_update_layout;
             }
             Event::WindowTitleChanged(wid, new_title) => {
                 WindowEventHandler::handle_window_title_changed(self, wid, new_title);
@@ -1073,8 +1098,10 @@ impl Reactor {
         self.finalize_event_processing(
             raised_window,
             is_resize,
+            should_update_layout,
             window_was_destroyed,
             should_update_notifications,
+            force_instant_layout,
         );
     }
 
@@ -1082,8 +1109,10 @@ impl Reactor {
         &mut self,
         raised_window: Option<WindowId>,
         is_resize: bool,
+        should_update_layout: bool,
         window_was_destroyed: bool,
         should_update_notifications: bool,
+        force_instant_layout: bool,
     ) {
         if self.display_topology_manager.is_churning_or_awaiting_commit() {
             return;
@@ -1096,13 +1125,15 @@ impl Reactor {
         }
 
         let mut layout_changed = false;
-        if !self.is_in_drag() || window_was_destroyed {
-            layout_changed = self.update_layout_or_warn(
+        if should_update_layout && (!self.is_in_drag() || window_was_destroyed) {
+            layout_changed = self.update_layout_or_warn_with_options(
                 is_resize,
                 matches!(
                     self.workspace_switch_manager.workspace_switch_state,
                     WorkspaceSwitchState::Active
                 ),
+                force_instant_layout,
+                "Layout update failed",
             );
             self.maybe_send_menu_update();
         }
@@ -2738,7 +2769,9 @@ impl Reactor {
         self.maybe_send_menu_update();
     }
 
-    fn force_refresh_all_windows(&mut self) { self.request_visible_windows_for_apps(true); }
+    fn force_refresh_all_windows(&mut self) {
+        self.request_visible_windows_for_apps(true);
+    }
 
     fn request_close_window(&mut self, wid: WindowId) {
         if let Some(app) = self.app_manager.apps.get(&wid.pid) {
@@ -2748,7 +2781,9 @@ impl Reactor {
         }
     }
 
-    fn main_window(&self) -> Option<WindowId> { self.main_window_tracker.main_window() }
+    fn main_window(&self) -> Option<WindowId> {
+        self.main_window_tracker.main_window()
+    }
 
     fn main_window_space(&self) -> Option<SpaceId> {
         // TODO: Optimize this with a cache or something.
@@ -2960,7 +2995,12 @@ impl Reactor {
         is_resize: bool,
         is_workspace_switch: bool,
     ) -> bool {
-        self.update_layout_or_warn_with(is_resize, is_workspace_switch, "Layout update failed")
+        self.update_layout_or_warn_with_options(
+            is_resize,
+            is_workspace_switch,
+            false,
+            "Layout update failed",
+        )
     }
 
     pub(crate) fn update_layout_or_warn_with(
@@ -2969,9 +3009,20 @@ impl Reactor {
         is_workspace_switch: bool,
         context: &'static str,
     ) -> bool {
-        LayoutManager::update_layout(self, is_resize, is_workspace_switch).unwrap_or_else(|e| {
-            warn!(error = ?e, "{}", context);
-            false
-        })
+        self.update_layout_or_warn_with_options(is_resize, is_workspace_switch, false, context)
+    }
+
+    pub(crate) fn update_layout_or_warn_with_options(
+        &mut self,
+        is_resize: bool,
+        is_workspace_switch: bool,
+        force_instant: bool,
+        context: &'static str,
+    ) -> bool {
+        LayoutManager::update_layout(self, is_resize, is_workspace_switch, force_instant)
+            .unwrap_or_else(|e| {
+                warn!(error = ?e, "{}", context);
+                false
+            })
     }
 }

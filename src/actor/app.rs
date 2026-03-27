@@ -4,8 +4,11 @@
 //! These APIs support reading and writing window states like position and size.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,8 +20,6 @@ use objc2_application_services::AXError;
 use objc2_core_foundation::{CFRunLoop, CGPoint, CGRect};
 use serde::{Deserialize, Serialize};
 use tokio::{join, select};
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
@@ -67,7 +68,9 @@ pub struct WindowId {
 
 impl serde::ser::Serialize for WindowId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::ser::Serializer {
+    where
+        S: serde::ser::Serializer,
+    {
         use serde::ser::SerializeStruct;
         let mut s = serializer.serialize_struct("WindowId", 2)?;
         s.serialize_field("pid", &self.pid)?;
@@ -78,7 +81,9 @@ impl serde::ser::Serialize for WindowId {
 
 impl<'de> serde::de::Deserialize<'de> for WindowId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where D: serde::de::Deserializer<'de> {
+    where
+        D: serde::de::Deserializer<'de>,
+    {
         struct WindowIdVisitor;
         impl<'de> serde::de::Visitor<'de> for WindowIdVisitor {
             type Value = WindowId;
@@ -90,13 +95,17 @@ impl<'de> serde::de::Deserialize<'de> for WindowId {
             }
 
             fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where E: serde::de::Error {
+            where
+                E: serde::de::Error,
+            {
                 WindowId::from_debug_string(v)
                     .ok_or_else(|| E::custom("invalid WindowId debug string"))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<WindowId, A::Error>
-            where A: serde::de::SeqAccess<'de> {
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
                 let pid: pid_t = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
@@ -111,7 +120,9 @@ impl<'de> serde::de::Deserialize<'de> for WindowId {
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where M: serde::de::MapAccess<'de> {
+            where
+                M: serde::de::MapAccess<'de>,
+            {
                 let mut pid: Option<pid_t> = None;
                 let mut idx: Option<u32> = None;
 
@@ -170,21 +181,39 @@ impl WindowId {
         })
     }
 
-    pub fn to_debug_string(&self) -> String { format!("{:?}", self) }
+    pub fn to_debug_string(&self) -> String {
+        format!("{:?}", self)
+    }
 }
 
 #[derive(Clone)]
 pub struct AppThreadHandle {
     requests_tx: actor::Sender<Request>,
+    animation_write_micros: Arc<AtomicU64>,
 }
 
 impl AppThreadHandle {
     pub(crate) fn new_for_test(requests_tx: actor::Sender<Request>) -> Self {
-        let this = AppThreadHandle { requests_tx };
+        let this = AppThreadHandle {
+            requests_tx,
+            animation_write_micros: Arc::new(AtomicU64::new(0)),
+        };
         this
     }
 
-    pub fn send(&self, req: Request) -> anyhow::Result<()> { Ok(self.requests_tx.send(req)) }
+    pub fn send(&self, req: Request) -> anyhow::Result<()> {
+        Ok(self.requests_tx.send(req))
+    }
+
+    pub fn adaptive_animation_fps(&self, configured_fps: f64) -> f64 {
+        let write_micros = self.animation_write_micros.load(Ordering::Relaxed);
+        if write_micros == 0 {
+            return configured_fps;
+        }
+
+        let sustainable_fps = Duration::from_secs(1).as_micros() as f64 / write_micros as f64;
+        configured_fps.min(sustainable_fps.max(1.0))
+    }
 }
 
 impl Debug for AppThreadHandle {
@@ -202,6 +231,7 @@ pub enum Request {
 
     SetWindowFrame(WindowId, CGRect, TransactionId, bool),
     SetBatchWindowFrame(Vec<(WindowId, CGRect)>, TransactionId),
+    SetBatchWindowPos(Vec<(WindowId, CGPoint)>, TransactionId),
     SetWindowPos(WindowId, CGPoint, TransactionId, bool),
 
     BeginWindowAnimation(WindowId),
@@ -251,6 +281,7 @@ struct State {
     is_hidden: bool,
     is_frontmost: bool,
     raises_tx: actor::Sender<RaiseRequest>,
+    animation_write_micros: Arc<AtomicU64>,
     tx_store: Option<WindowTxStore>,
 }
 
@@ -260,6 +291,7 @@ struct AppWindowState {
     hidden_by_app: bool,
     window_server_id: Option<WindowServerId>,
     is_animating: bool,
+    cached_frame: CGRect,
 }
 
 const APP_NOTIFICATIONS: &[&str] = &[
@@ -286,6 +318,17 @@ const WINDOW_ANIMATION_NOTIFICATIONS: &[&str] =
     &[kAXWindowMovedNotification, kAXWindowResizedNotification];
 
 impl State {
+    fn record_animation_write(&self, duration: Duration) {
+        let sample = duration.as_micros().max(1) as u64;
+        let old = self.animation_write_micros.load(Ordering::Relaxed);
+        let next = if old == 0 {
+            sample
+        } else {
+            (old.saturating_mul(3) + sample) / 4
+        };
+        self.animation_write_micros.store(next, Ordering::Relaxed);
+    }
+
     fn txid_from_store(&self, wsid: Option<WindowServerId>) -> Option<TransactionId> {
         let store = self.tx_store.as_ref()?;
         let wsid = wsid?;
@@ -314,7 +357,10 @@ impl State {
         notifications_rx: actor::Receiver<(AXUIElement, String)>,
         raises_rx: actor::Receiver<RaiseRequest>,
     ) {
-        let handle = AppThreadHandle { requests_tx };
+        let handle = AppThreadHandle {
+            requests_tx,
+            animation_write_micros: self.animation_write_micros.clone(),
+        };
         if !self.init(handle, info) {
             return;
         }
@@ -328,50 +374,112 @@ impl State {
 
     async fn handle_incoming(
         this: &RefCell<Self>,
-        requests_rx: actor::Receiver<Request>,
-        notifications_rx: actor::Receiver<(AXUIElement, String)>,
+        mut requests_rx: actor::Receiver<Request>,
+        mut notifications_rx: actor::Receiver<(AXUIElement, String)>,
     ) {
         pub enum Incoming {
             Notification((Span, (AXUIElement, String))),
             Request((Span, Request)),
         }
 
-        let mut merged = StreamExt::merge(
-            UnboundedReceiverStream::new(requests_rx).map(Incoming::Request),
-            UnboundedReceiverStream::new(notifications_rx).map(Incoming::Notification),
-        );
+        let mut pending_requests = VecDeque::new();
 
-        while let Some(incoming) = merged.next().await {
-            let mut this = this.borrow_mut();
+        loop {
+            let incoming = if let Some(request) = pending_requests.pop_front() {
+                Some(Incoming::Request(request))
+            } else {
+                tokio::select! {
+                    request = requests_rx.recv(), if !requests_rx.is_closed() => {
+                        request.map(Incoming::Request)
+                    }
+                    notification = notifications_rx.recv(), if !notifications_rx.is_closed() => {
+                        notification.map(Incoming::Notification)
+                    }
+                    else => None,
+                }
+            };
+            let Some(incoming) = incoming else {
+                break;
+            };
+
             match incoming {
-                Incoming::Request((span, mut request)) => {
-                    let _guard = span.enter();
-                    debug!(?this.bundle_id, ?this.pid, ?request, "Got request");
-                    match this.handle_request(&mut request) {
-                        Ok(should_terminate) if should_terminate => break,
-                        Ok(_) => (),
-                        #[allow(non_upper_case_globals)]
-                        Err(AxError::Ax(AXError::CannotComplete))
-                        // SAFETY: NSRunningApplication is thread-safe.
-                        if this.running_app.isTerminated() =>
-                        {
-                            // The app does not appear to be running anymore.
-                            // Normally this would be noticed by notification_center,
-                            // but the notification doesn't always happen.
-                            warn!(?this.bundle_id, ?this.pid, "Application terminated without notification");
-                            this.send_event(Event::ApplicationThreadTerminated(this.pid));
-                            break;
-                        }
-                        Err(err) => {
-                            warn!(?this.bundle_id, ?this.pid, ?request, "Error handling request: {:?}", err);
+                Incoming::Request(request) => {
+                    let requests = {
+                        let this = this.borrow();
+                        Self::coalesce_animation_requests(
+                            &this,
+                            request,
+                            &mut requests_rx,
+                            &mut pending_requests,
+                        )
+                    };
+                    for (span, mut request) in requests {
+                        let mut this = this.borrow_mut();
+                        let _guard = span.enter();
+                        debug!(?this.bundle_id, ?this.pid, ?request, "Got request");
+                        match this.handle_request(&mut request) {
+                            Ok(should_terminate) if should_terminate => return,
+                            Ok(_) => (),
+                            #[allow(non_upper_case_globals)]
+                            Err(AxError::Ax(AXError::CannotComplete))
+                            // SAFETY: NSRunningApplication is thread-safe.
+                            if this.running_app.isTerminated() =>
+                            {
+                                warn!(?this.bundle_id, ?this.pid, "Application terminated without notification");
+                                this.send_event(Event::ApplicationThreadTerminated(this.pid));
+                                return;
+                            }
+                            Err(err) => {
+                                warn!(?this.bundle_id, ?this.pid, ?request, "Error handling request: {:?}", err);
+                            }
                         }
                     }
                 }
                 Incoming::Notification((_, (elem, notif))) => {
+                    let mut this = this.borrow_mut();
                     this.handle_notification(elem, &notif);
                 }
             }
         }
+    }
+
+    fn request_coalescing_key(&self, request: &Request) -> Option<WindowId> {
+        let wid = match request {
+            Request::SetWindowPos(wid, ..) | Request::SetWindowFrame(wid, ..) => *wid,
+            _ => return None,
+        };
+        self.window(wid).ok().filter(|window| window.is_animating)?;
+        Some(wid)
+    }
+
+    fn coalesce_animation_requests(
+        &self,
+        request: (Span, Request),
+        requests_rx: &mut actor::Receiver<Request>,
+        pending_requests: &mut VecDeque<(Span, Request)>,
+    ) -> Vec<(Span, Request)> {
+        let Some(_) = self.request_coalescing_key(&request.1) else {
+            return vec![request];
+        };
+
+        let mut coalesced = vec![request];
+        while let Ok(next_request) = requests_rx.try_recv() {
+            let Some(wid) = self.request_coalescing_key(&next_request.1) else {
+                pending_requests.push_back(next_request);
+                break;
+            };
+
+            if let Some(existing) = coalesced
+                .iter_mut()
+                .find(|(_, request)| self.request_coalescing_key(request) == Some(wid))
+            {
+                *existing = next_request;
+            } else {
+                coalesced.push(next_request);
+            }
+        }
+
+        coalesced
     }
 
     async fn handle_raises(this: &RefCell<Self>, mut rx: actor::Receiver<RaiseRequest>) {
@@ -518,10 +626,11 @@ impl State {
                 });
             }
             &mut Request::SetWindowPos(wid, pos, txid, eui) => {
-                let (elem, is_animating) = match self.window_mut(wid) {
+                let (elem, is_animating, frame) = match self.window_mut(wid) {
                     Ok(window) => {
                         window.last_seen_txid = txid;
-                        (window.elem.clone(), window.is_animating)
+                        window.cached_frame.origin = pos;
+                        (window.elem.clone(), window.is_animating, window.cached_frame)
                     }
                     Err(err) => match err {
                         AxError::Ax(code) => {
@@ -537,16 +646,44 @@ impl State {
                 };
 
                 if eui && !is_animating {
+                    let write_started = Instant::now();
                     let _ = with_enhanced_ui_disabled(&self.app, || elem.set_position(pos));
+                    if is_animating {
+                        self.record_animation_write(write_started.elapsed());
+                    }
+                    trace!(
+                        ?wid,
+                        bundle_id = ?self.bundle_id,
+                        is_animating,
+                        elapsed_ms = write_started.elapsed().as_secs_f64() * 1000.0,
+                        "SetWindowPos AX write finished"
+                    );
                 } else {
+                    let write_started = Instant::now();
                     let _ = elem.set_position(pos);
+                    if is_animating {
+                        self.record_animation_write(write_started.elapsed());
+                    }
+                    trace!(
+                        ?wid,
+                        bundle_id = ?self.bundle_id,
+                        is_animating,
+                        elapsed_ms = write_started.elapsed().as_secs_f64() * 1000.0,
+                        "SetWindowPos AX write finished"
+                    );
                 };
 
-                let frame =
+                let frame = if is_animating {
+                    frame
+                } else {
                     match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
                         Some(frame) => frame,
                         None => return Ok(false),
-                    };
+                    }
+                };
+                if let Ok(window) = self.window_mut(wid) {
+                    window.cached_frame = frame;
+                }
 
                 self.send_event(Event::WindowFrameChanged(
                     wid,
@@ -560,6 +697,7 @@ impl State {
                 let (elem, is_animating) = match self.window_mut(wid) {
                     Ok(window) => {
                         window.last_seen_txid = txid;
+                        window.cached_frame = desired;
                         (window.elem.clone(), window.is_animating)
                     }
                     Err(err) => match err {
@@ -574,22 +712,50 @@ impl State {
                 };
 
                 if eui && !is_animating {
+                    let write_started = Instant::now();
                     with_enhanced_ui_disabled(&self.app, || {
                         let _ = elem.set_size(desired.size);
                         let _ = elem.set_position(desired.origin);
                         let _ = elem.set_size(desired.size);
                     });
+                    if is_animating {
+                        self.record_animation_write(write_started.elapsed());
+                    }
+                    trace!(
+                        ?wid,
+                        bundle_id = ?self.bundle_id,
+                        is_animating,
+                        elapsed_ms = write_started.elapsed().as_secs_f64() * 1000.0,
+                        "SetWindowFrame AX write finished"
+                    );
                 } else {
+                    let write_started = Instant::now();
                     let _ = elem.set_size(desired.size);
                     let _ = elem.set_position(desired.origin);
                     let _ = elem.set_size(desired.size);
+                    if is_animating {
+                        self.record_animation_write(write_started.elapsed());
+                    }
+                    trace!(
+                        ?wid,
+                        bundle_id = ?self.bundle_id,
+                        is_animating,
+                        elapsed_ms = write_started.elapsed().as_secs_f64() * 1000.0,
+                        "SetWindowFrame AX write finished"
+                    );
                 }
 
-                let frame =
+                let frame = if is_animating {
+                    desired
+                } else {
                     match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
                         Some(frame) => frame,
                         None => return Ok(false),
-                    };
+                    }
+                };
+                if let Ok(window) = self.window_mut(wid) {
+                    window.cached_frame = frame;
+                }
 
                 self.send_event(Event::WindowFrameChanged(
                     wid,
@@ -603,10 +769,11 @@ impl State {
                 let app = self.app.clone();
                 let result = with_enhanced_ui_disabled(&app, || -> Result<(), AxError> {
                     for (wid, desired) in frames.iter() {
-                        let elem = match self.window_mut(*wid) {
+                        let (elem, is_animating) = match self.window_mut(*wid) {
                             Ok(window) => {
                                 window.last_seen_txid = txid;
-                                window.elem.clone()
+                                window.cached_frame = *desired;
+                                (window.elem.clone(), window.is_animating)
                             }
                             Err(err) => match err {
                                 AxError::Ax(code) => {
@@ -619,14 +786,78 @@ impl State {
                             },
                         };
 
+                        let write_started = Instant::now();
                         let _ = elem.set_size(desired.size);
                         let _ = elem.set_position(desired.origin);
                         let _ = elem.set_size(desired.size);
+                        if is_animating {
+                            self.record_animation_write(write_started.elapsed());
+                        }
 
-                        let frame = match self.handle_ax_result(*wid, elem.frame())? {
-                            Some(frame) => frame,
-                            None => continue,
+                        let frame = if is_animating {
+                            *desired
+                        } else {
+                            match self.handle_ax_result(*wid, elem.frame())? {
+                                Some(frame) => frame,
+                                None => continue,
+                            }
                         };
+                        if let Ok(window) = self.window_mut(*wid) {
+                            window.cached_frame = frame;
+                        }
+
+                        self.send_event(Event::WindowFrameChanged(
+                            *wid,
+                            frame,
+                            Some(txid),
+                            Requested(true),
+                            None,
+                        ));
+                    }
+                    Ok(())
+                });
+                if let Err(err) = result {
+                    return Err(err);
+                }
+            }
+            &mut Request::SetBatchWindowPos(ref mut positions, txid) => {
+                let app = self.app.clone();
+                let result = with_enhanced_ui_disabled(&app, || -> Result<(), AxError> {
+                    for (wid, pos) in positions.iter() {
+                        let (elem, is_animating, frame) = match self.window_mut(*wid) {
+                            Ok(window) => {
+                                window.last_seen_txid = txid;
+                                window.cached_frame.origin = *pos;
+                                (window.elem.clone(), window.is_animating, window.cached_frame)
+                            }
+                            Err(err) => match err {
+                                AxError::Ax(code) => {
+                                    if self.handle_ax_error(*wid, &code) {
+                                        continue;
+                                    }
+                                    return Err(AxError::Ax(code));
+                                }
+                                AxError::NotFound => continue,
+                            },
+                        };
+
+                        let write_started = Instant::now();
+                        let _ = elem.set_position(*pos);
+                        if is_animating {
+                            self.record_animation_write(write_started.elapsed());
+                        }
+
+                        let frame = if is_animating {
+                            frame
+                        } else {
+                            match self.handle_ax_result(*wid, elem.frame())? {
+                                Some(frame) => frame,
+                                None => continue,
+                            }
+                        };
+                        if let Ok(window) = self.window_mut(*wid) {
+                            window.cached_frame = frame;
+                        }
 
                         self.send_event(Event::WindowFrameChanged(
                             *wid,
@@ -682,6 +913,9 @@ impl State {
                         Some(frame) => frame,
                         None => return Ok(false),
                     };
+                if let Ok(window) = self.window_mut(wid) {
+                    window.cached_frame = frame;
+                }
                 self.send_event(Event::WindowFrameChanged(
                     wid,
                     frame,
@@ -777,6 +1011,9 @@ impl State {
                         return;
                     }
                 };
+                if let Ok(window) = self.window_mut(wid) {
+                    window.cached_frame = frame;
+                }
                 self.send_event(Event::WindowFrameChanged(
                     wid,
                     frame,
@@ -829,7 +1066,9 @@ enum RaiseError {
 }
 
 impl From<AxError> for RaiseError {
-    fn from(value: AxError) -> Self { Self::AXError(value) }
+    fn from(value: AxError) -> Self {
+        Self::AXError(value)
+    }
 }
 
 impl State {
@@ -1177,13 +1416,17 @@ impl State {
         let hidden_by_app = self.is_hidden;
         let last_seen_txid = self.txid_from_store(window_server_id).unwrap_or_default();
 
-        let old = self.windows.insert(wid, AppWindowState {
-            elem,
-            last_seen_txid,
-            hidden_by_app,
-            window_server_id,
-            is_animating: false,
-        });
+        let old = self.windows.insert(
+            wid,
+            AppWindowState {
+                elem,
+                last_seen_txid,
+                hidden_by_app,
+                window_server_id,
+                is_animating: false,
+                cached_frame: info.frame,
+            },
+        );
         debug_assert!(old.is_none(), "Duplicate window id {wid:?}");
         if hidden_by_app {
             self.send_event(Event::WindowMinimized(wid));
@@ -1283,7 +1526,9 @@ impl State {
         }
     }
 
-    fn send_event(&self, event: Event) { self.events_tx.send(event); }
+    fn send_event(&self, event: Event) {
+        self.events_tx.send(event);
+    }
 
     fn window(&self, wid: WindowId) -> Result<&AppWindowState, AxError> {
         assert_eq!(wid.pid, self.pid);
@@ -1328,7 +1573,9 @@ impl State {
         }
     }
 
-    fn has_active_window_animations(&self) -> bool { self.windows.values().any(|w| w.is_animating) }
+    fn has_active_window_animations(&self) -> bool {
+        self.windows.values().any(|w| w.is_animating)
+    }
 
     fn remove_window(&mut self, wid: WindowId) -> Option<AppWindowState> {
         let window = self.windows.remove(&wid)?;
@@ -1383,6 +1630,7 @@ fn app_thread_main(
         observer.install(move |elem, notif| _ = notifications_tx.send((elem, notif.to_owned())));
 
     let (raises_tx, raises_rx) = actor::channel();
+    let animation_write_micros = Arc::new(AtomicU64::new(0));
     let state = State {
         pid,
         running_app,
@@ -1397,6 +1645,7 @@ fn app_thread_main(
         is_hidden: false,
         is_frontmost: false,
         raises_tx,
+        animation_write_micros,
         tx_store,
     };
 

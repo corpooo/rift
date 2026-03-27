@@ -7,21 +7,16 @@ use super::TransactionId;
 use crate::actor::app::{AppThreadHandle, Request, WindowId, pid_t};
 use crate::actor::reactor::Reactor;
 use crate::common::collections::HashMap;
-use crate::common::config::AnimationEasing;
+use crate::common::config::{AnimationEasing, LayoutMode};
 use crate::sys::geometry::{Round, SameAs};
 use crate::sys::power;
 use crate::sys::screen::SpaceId;
-use crate::sys::timer::Timer;
 use crate::sys::window_server::WindowServerId;
 
 #[derive(Debug)]
 pub struct Animation<'a> {
-    //start: CFAbsoluteTime,
-    //interval: CFTimeInterval,
-    start: Instant,
-    interval: Duration,
-    frames: u32,
-
+    configured_fps: f64,
+    duration: Duration,
     windows: Vec<(
         &'a AppThreadHandle,
         WindowId,
@@ -34,13 +29,9 @@ pub struct Animation<'a> {
 
 impl<'a> Animation<'a> {
     pub fn new(fps: f64, duration: f64, _: AnimationEasing) -> Self {
-        let interval = Duration::from_secs_f64(1.0 / fps);
-        // let now = unsafe { CFAbsoluteTimeGetCurrent() };
-        let now = Instant::now();
         Animation {
-            start: now, // + interval, // not necessary, provide one extra frame to get things going
-            interval,
-            frames: (duration * fps).round() as u32,
+            configured_fps: fps.min(60.0),
+            duration: Duration::from_secs_f64(duration.max(0.0)),
             windows: vec![],
         }
     }
@@ -64,8 +55,9 @@ impl<'a> Animation<'a> {
 
         for &(handle, wid, from, to, is_focus, txid) in &self.windows {
             _ = handle.send(Request::BeginWindowAnimation(wid));
-            // Resize new windows immediately.
-            if is_focus {
+            // Resize new windows immediately, but keep pure translations on
+            // the cheaper position-only path for the full animation.
+            if is_focus && size_changed(from, to) {
                 let frame = CGRect {
                     origin: from.origin,
                     size: to.size,
@@ -74,23 +66,41 @@ impl<'a> Animation<'a> {
             }
         }
 
+        let start = Instant::now();
+        let duration_secs = self.duration.as_secs_f64();
         let mut next_frames = Vec::with_capacity(self.windows.len());
-        for frame in 1..=self.frames {
-            let t: f64 = f64::from(frame) / f64::from(self.frames);
+        let mut sent_mid_resize = false;
+
+        loop {
+            let elapsed = start.elapsed();
+            if elapsed < self.duration {
+                let fps = self.effective_fps();
+                let interval = Duration::from_secs_f64(1.0 / fps);
+                std::thread::sleep(interval.min(self.duration - elapsed));
+            }
+
+            let t = if duration_secs == 0.0 {
+                1.0
+            } else {
+                (start.elapsed().as_secs_f64() / duration_secs).min(1.0)
+            };
+            let is_final = t >= 1.0;
+            let should_resize = is_final || (!sent_mid_resize && t >= 0.5);
 
             next_frames.clear();
             for (_, _, from, to, _, _) in &self.windows {
                 next_frames.push(get_frame(*from, *to, t));
             }
 
-            let deadline = self.start + frame * self.interval;
-            let duration = deadline - Instant::now();
-            if duration < Duration::ZERO {
-                continue;
-            }
-            Timer::sleep(duration);
+            let mut frames_by_pid: HashMap<pid_t, (&AppThreadHandle, TransactionId, Vec<(WindowId, CGRect)>)> =
+                HashMap::default();
+            let mut positions_by_pid: HashMap<
+                pid_t,
+                (&AppThreadHandle, TransactionId, Vec<(WindowId, CGPoint)>),
+            > = HashMap::default();
 
-            for (&(handle, wid, _, to, _, txid), rect) in self.windows.iter().zip(&next_frames) {
+            for (&(handle, wid, from, to, _, txid), rect) in self.windows.iter().zip(&next_frames)
+            {
                 let mut rect = *rect;
                 // Round interpolated positions to whole pixels to prevent a
                 // feedback loop: sub-pixel values get rounded by macOS, rift
@@ -100,18 +110,56 @@ impl<'a> Animation<'a> {
                 // Actually don't animate size, too slow. Resize halfway through
                 // and then set the size again at the end, in case it got
                 // clipped during the animation.
-                if frame * 2 == self.frames || frame == self.frames {
+                if should_resize && size_changed(from, to) {
                     rect.size = to.size;
+                    let entry = frames_by_pid
+                        .entry(wid.pid)
+                        .or_insert((handle, txid, Vec::new()));
+                    entry.2.push((wid, rect));
+                } else {
+                    let entry = positions_by_pid
+                        .entry(wid.pid)
+                        .or_insert((handle, txid, Vec::new()));
+                    entry.2.push((wid, rect.origin));
+                }
+            }
+
+            for (_, (handle, txid, frames)) in frames_by_pid {
+                if frames.len() == 1 {
+                    let (wid, rect) = frames.into_iter().next().unwrap();
                     _ = handle.send(Request::SetWindowFrame(wid, rect, txid, false));
                 } else {
-                    _ = handle.send(Request::SetWindowPos(wid, rect.origin, txid, false));
+                    _ = handle.send(Request::SetBatchWindowFrame(frames, txid));
                 }
+            }
+            for (_, (handle, txid, positions)) in positions_by_pid {
+                if positions.len() == 1 {
+                    let (wid, pos) = positions.into_iter().next().unwrap();
+                    _ = handle.send(Request::SetWindowPos(wid, pos, txid, false));
+                } else {
+                    _ = handle.send(Request::SetBatchWindowPos(positions, txid));
+                }
+            }
+
+            if should_resize && !is_final {
+                sent_mid_resize = true;
+            }
+            if is_final {
+                break;
             }
         }
 
         for &(handle, wid, ..) in &self.windows {
             _ = handle.send(Request::EndWindowAnimation(wid));
         }
+    }
+
+    fn effective_fps(&self) -> f64 {
+        self.windows
+            .iter()
+            .map(|(handle, ..)| handle.adaptive_animation_fps(self.configured_fps))
+            .fold(self.configured_fps, f64::min)
+            .max(1.0)
     }
 
     #[allow(dead_code)]
@@ -145,7 +193,31 @@ fn ease(t: f64) -> f64 {
     }
 }
 
-fn blend(a: f64, b: f64, s: f64) -> f64 { (1.0 - s) * a + s * b }
+fn blend(a: f64, b: f64, s: f64) -> f64 {
+    (1.0 - s) * a + s * b
+}
+
+fn size_changed(current: CGRect, target: CGRect) -> bool {
+    !current.size.same_as(target.size)
+}
+
+fn visible_width_ratio(frame: CGRect, screen: CGRect) -> f64 {
+    let visible_left = frame.origin.x.max(screen.origin.x);
+    let visible_right = frame.max().x.min(screen.max().x);
+    let visible_width = (visible_right - visible_left).max(0.0);
+    if frame.size.width <= 0.0 {
+        0.0
+    } else {
+        visible_width / frame.size.width
+    }
+}
+
+fn should_skip_scrolling_animation(current: CGRect, target: CGRect, screen: CGRect) -> bool {
+    const MIN_VISIBLE_RATIO_FOR_ANIMATION: f64 = 0.1;
+
+    visible_width_ratio(current, screen) < MIN_VISIBLE_RATIO_FOR_ANIMATION
+        && visible_width_ratio(target, screen) < MIN_VISIBLE_RATIO_FOR_ANIMATION
+}
 
 pub struct AnimationManager;
 
@@ -165,6 +237,10 @@ impl AnimationManager {
             reactor.config.settings.animation_duration,
             reactor.config.settings.animation_easing.clone(),
         );
+        let scrolling_screen = (reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+            == LayoutMode::Scrolling)
+            .then(|| reactor.space_manager.screen_by_space(space).map(|screen| screen.frame))
+            .flatten();
         let mut animated_count = 0;
         let mut animated_wids_wsids: Vec<u32> = Vec::new();
         let mut any_frame_changed = false;
@@ -217,8 +293,27 @@ impl AnimationManager {
                 .virtual_workspace_manager()
                 .workspace_for_window(space, wid)
                 .map_or(false, |ws| ws == active_ws);
+            let skip_edge_parked_animation = scrolling_screen.is_some_and(|screen| {
+                should_skip_scrolling_animation(current_frame, target_frame, screen)
+            });
+            if let Some(screen) = scrolling_screen {
+                let current_visible = visible_width_ratio(current_frame, screen);
+                let target_visible = visible_width_ratio(target_frame, screen);
+                if current_visible < 1.0 || target_visible < 1.0 {
+                    debug!(
+                        ?wid,
+                        ?current_frame,
+                        ?target_frame,
+                        is_active,
+                        current_visible,
+                        target_visible,
+                        skip_edge_parked_animation,
+                        "Scrolling animation decision"
+                    );
+                }
+            }
 
-            if is_active {
+            if is_active && !skip_edge_parked_animation {
                 trace!(?wid, ?current_frame, ?target_frame, "Animating visible window");
                 animated_wids_wsids.push(wid.idx.into());
                 anim.add_window(&app_state.handle, wid, current_frame, target_frame, false, txid);
@@ -231,7 +326,8 @@ impl AnimationManager {
                     ?wid,
                     ?current_frame,
                     ?target_frame,
-                    "Direct positioning hidden window"
+                    skip_edge_parked_animation,
+                    "Direct positioning non-animated window"
                 );
                 if let Some(wsid) = window_server_id {
                     reactor.transaction_manager.update_txid_entries([(wsid, txid, target_frame)]);
@@ -366,5 +462,74 @@ impl AnimationManager {
         }
 
         any_frame_changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+
+    use super::{should_skip_scrolling_animation, size_changed, visible_width_ratio};
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
+        CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+    }
+
+    #[test]
+    fn scrolling_animation_skips_hidden_edge_to_hidden_edge_moves() {
+        let screen = rect(0.0, 0.0, 3840.0, 1589.0);
+        let current = rect(-2200.0, 39.0, 2294.0, 1573.0);
+        let target = rect(-2240.0, 39.0, 2294.0, 1573.0);
+        assert!(should_skip_scrolling_animation(current, target, screen));
+    }
+
+    #[test]
+    fn scrolling_animation_keeps_visible_to_hidden_moves_animated() {
+        let screen = rect(0.0, 0.0, 3840.0, 1589.0);
+        let current = rect(770.0, 39.0, 2294.0, 1573.0);
+        let target = rect(3832.0, 39.0, 2294.0, 1573.0);
+        assert!(!should_skip_scrolling_animation(current, target, screen));
+    }
+
+    #[test]
+    fn scrolling_animation_keeps_hidden_to_visible_moves_animated() {
+        let screen = rect(0.0, 0.0, 3840.0, 1589.0);
+        let current = rect(-1719.0, 39.0, 2294.0, 1573.0);
+        let target = rect(770.0, 39.0, 2294.0, 1573.0);
+        assert!(!should_skip_scrolling_animation(current, target, screen));
+    }
+
+    #[test]
+    fn visible_width_ratio_tracks_partially_visible_columns() {
+        let screen = rect(0.0, 0.0, 3840.0, 1589.0);
+        let frame = rect(-1719.0, 39.0, 2294.0, 1573.0);
+        let ratio = visible_width_ratio(frame, screen);
+        assert!(ratio > 0.2 && ratio < 0.3, "unexpected ratio {ratio}");
+    }
+
+    #[test]
+    fn scrolling_animation_keeps_meaningfully_visible_edge_columns_animated() {
+        let screen = rect(0.0, 0.0, 3840.0, 1589.0);
+        let current = rect(-900.0, 39.0, 2294.0, 1573.0);
+        let target = rect(770.0, 39.0, 2294.0, 1573.0);
+        assert!(!should_skip_scrolling_animation(current, target, screen));
+    }
+
+    #[test]
+    fn scrolling_animation_keeps_partially_visible_columns_animated_when_parking() {
+        let screen = rect(0.0, 0.0, 3840.0, 1589.0);
+        let current = rect(-1719.0, 39.0, 2294.0, 1573.0);
+        let target = rect(-2200.0, 39.0, 2294.0, 1573.0);
+        assert!(!should_skip_scrolling_animation(current, target, screen));
+    }
+
+    #[test]
+    fn size_changed_only_for_real_resizes() {
+        let current = rect(-1719.0, 39.0, 2294.0, 1573.0);
+        let translated = rect(-2200.0, 39.0, 2294.0, 1573.0);
+        let resized = rect(-2200.0, 39.0, 2200.0, 1573.0);
+
+        assert!(!size_changed(current, translated));
+        assert!(size_changed(current, resized));
     }
 }

@@ -16,6 +16,28 @@ use crate::sys::window_server::{WindowServerId, WindowServerInfo};
 
 pub struct WindowEventHandler;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FrameChangeOutcome {
+    pub is_resize: bool,
+    pub should_update_layout: bool,
+}
+
+impl FrameChangeOutcome {
+    fn skip() -> Self {
+        Self {
+            is_resize: false,
+            should_update_layout: false,
+        }
+    }
+
+    fn update(is_resize: bool) -> Self {
+        Self {
+            is_resize,
+            should_update_layout: true,
+        }
+    }
+}
+
 impl WindowEventHandler {
     pub fn handle_window_created(
         reactor: &mut Reactor,
@@ -180,7 +202,7 @@ impl WindowEventHandler {
         last_seen: Option<TransactionId>,
         requested: Requested,
         mouse_state: Option<MouseState>,
-    ) -> bool {
+    ) -> FrameChangeOutcome {
         debug!(
             ?wid,
             ?new_frame,
@@ -192,14 +214,14 @@ impl WindowEventHandler {
         );
 
         let effective_mouse_state = mouse_state.or_else(|| get_mouse_state());
-        let result = (|| -> bool {
+        let result = (|| -> FrameChangeOutcome {
             let (server_id, old_frame) = {
                 let Some(window) = reactor.window_manager.windows.get(&wid) else {
-                    return false;
+                    return FrameChangeOutcome::skip();
                 };
 
                 if reactor.is_mission_control_active() {
-                    return false;
+                    return FrameChangeOutcome::skip();
                 }
 
                 (window.info.sys_id, window.frame_monotonic)
@@ -227,12 +249,12 @@ impl WindowEventHandler {
 
             if has_pending_request && last_seen.is_some_and(|seen| seen != last_sent_txid) {
                 debug!(?last_seen, ?last_sent_txid, "Ignoring frame change");
-                return false;
+                return FrameChangeOutcome::skip();
             }
 
             if triggered_by_rift {
                 let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
-                    return false;
+                    return FrameChangeOutcome::skip();
                 };
 
                 if let Some((wsid, target)) = pending_target {
@@ -262,7 +284,7 @@ impl WindowEventHandler {
                     }
                 }
 
-                return false;
+                return FrameChangeOutcome::skip();
             }
 
             if requested.0 {
@@ -279,7 +301,7 @@ impl WindowEventHandler {
                 if let Some(wsid) = server_id {
                     reactor.transaction_manager.clear_target_for_window(wsid);
                 }
-                return false;
+                return FrameChangeOutcome::skip();
             }
 
             let old_space = reactor.best_space_for_window(&old_frame, server_id);
@@ -288,15 +310,15 @@ impl WindowEventHandler {
             let new_active = new_space.is_some_and(|space| reactor.is_space_active(space));
 
             if !old_active && !new_active {
-                return false;
+                return FrameChangeOutcome::skip();
             }
 
             {
                 let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
-                    return false;
+                    return FrameChangeOutcome::skip();
                 };
                 if window.frame_monotonic.same_as(new_frame) {
-                    return false;
+                    return FrameChangeOutcome::skip();
                 }
                 window.frame_monotonic = new_frame;
             }
@@ -332,6 +354,7 @@ impl WindowEventHandler {
                 } else {
                     reactor.maybe_swap_on_drag(wid, new_frame);
                 }
+                return FrameChangeOutcome::update(is_resize);
             } else {
                 if old_space != new_space {
                     let keep_assigned_for_scrolling = old_space.is_some_and(|space| {
@@ -352,7 +375,7 @@ impl WindowEventHandler {
                             ?new_space,
                             "Ignoring geometry-only space change for scrolling tiled window"
                         );
-                        return false;
+                        return FrameChangeOutcome::skip();
                     }
 
                     reactor.send_layout_event(LayoutEvent::WindowRemovedPreserveFloating(wid));
@@ -377,6 +400,7 @@ impl WindowEventHandler {
                         }
                     }
                     let _ = reactor.update_layout_or_warn(false, false);
+                    return FrameChangeOutcome::skip();
                 } else if !old_frame.size.same_as(new_frame.size) {
                     if let Some(space) = old_space {
                         if reactor.is_space_active(space) {
@@ -396,13 +420,13 @@ impl WindowEventHandler {
                                 new_frame,
                                 screens,
                             });
-                            return true;
+                            return FrameChangeOutcome::update(true);
                         }
                     }
-                    return false;
+                    return FrameChangeOutcome::skip();
                 }
             }
-            false
+            FrameChangeOutcome::update(false)
         })();
         handle_mouse_up_if_needed(reactor, effective_mouse_state);
         result

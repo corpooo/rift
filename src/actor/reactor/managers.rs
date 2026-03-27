@@ -44,7 +44,9 @@ impl AppManager {
     }
 
     pub fn mark_wsids_recent<I>(&mut self, wsids: I)
-    where I: IntoIterator<Item = crate::sys::window_server::WindowServerId> {
+    where
+        I: IntoIterator<Item = crate::sys::window_server::WindowServerId>,
+    {
         let now = std::time::Instant::now();
         for ws in wsids {
             self.app_rules_recent_targets.insert(ws, now);
@@ -92,7 +94,9 @@ impl SpaceManager {
         self.screens.iter().filter_map(|screen| screen.space)
     }
 
-    pub fn first_known_space(&self) -> Option<SpaceId> { self.iter_known_spaces().next() }
+    pub fn first_known_space(&self) -> Option<SpaceId> {
+        self.iter_known_spaces().next()
+    }
 }
 
 /// Manages drag operations and window swapping
@@ -103,13 +107,21 @@ pub struct DragManager {
 }
 
 impl DragManager {
-    pub fn reset(&mut self) { self.drag_swap_manager.reset(); }
+    pub fn reset(&mut self) {
+        self.drag_swap_manager.reset();
+    }
 
-    pub fn last_target(&self) -> Option<WindowId> { self.drag_swap_manager.last_target() }
+    pub fn last_target(&self) -> Option<WindowId> {
+        self.drag_swap_manager.last_target()
+    }
 
-    pub fn dragged(&self) -> Option<WindowId> { self.drag_swap_manager.dragged() }
+    pub fn dragged(&self) -> Option<WindowId> {
+        self.drag_swap_manager.dragged()
+    }
 
-    pub fn origin_frame(&self) -> Option<CGRect> { self.drag_swap_manager.origin_frame() }
+    pub fn origin_frame(&self) -> Option<CGRect> {
+        self.drag_swap_manager.origin_frame()
+    }
 
     pub fn update_config(&mut self, config: WindowSnappingSettings) {
         self.drag_swap_manager.update_config(config);
@@ -234,9 +246,16 @@ impl LayoutManager {
         reactor: &mut Reactor,
         is_resize: bool,
         is_workspace_switch: bool,
+        force_instant: bool,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
         let layout_result = Self::calculate_layout(reactor);
-        Self::apply_layout(reactor, layout_result, is_resize, is_workspace_switch)
+        Self::apply_layout(
+            reactor,
+            layout_result,
+            is_resize,
+            is_workspace_switch,
+            force_instant,
+        )
     }
 
     fn calculate_layout(reactor: &mut Reactor) -> LayoutResult {
@@ -309,6 +328,7 @@ impl LayoutManager {
         layout_result: LayoutResult,
         is_resize: bool,
         is_workspace_switch: bool,
+        force_instant: bool,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
         let main_window = reactor.main_window();
         trace!(?main_window);
@@ -410,7 +430,8 @@ impl LayoutManager {
                 }
             }
 
-            let suppress_animation = is_workspace_switch
+            let suppress_animation = force_instant
+                || is_workspace_switch
                 || reactor.workspace_switch_manager.active_workspace_switch.is_some();
             if suppress_animation {
                 any_frame_changed |= AnimationManager::instant_layout(reactor, &layout, skip_wid);

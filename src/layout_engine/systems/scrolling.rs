@@ -271,9 +271,15 @@ impl Clone for LayoutState {
     }
 }
 
-fn default_atomic_bool() -> AtomicBool { AtomicBool::new(false) }
-fn default_atomic_i8() -> AtomicI8 { AtomicI8::new(0) }
-fn default_atomic() -> AtomicU64 { AtomicU64::new(0.0f64.to_bits()) }
+fn default_atomic_bool() -> AtomicBool {
+    AtomicBool::new(false)
+}
+fn default_atomic_i8() -> AtomicI8 {
+    AtomicI8::new(0)
+}
+fn default_atomic() -> AtomicU64 {
+    AtomicU64::new(0.0f64.to_bits())
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ScrollingLayoutSystem {
@@ -282,7 +288,9 @@ pub struct ScrollingLayoutSystem {
     settings: ScrollingLayoutSettings,
 }
 
-fn default_scrolling_settings() -> ScrollingLayoutSettings { ScrollingLayoutSettings::default() }
+fn default_scrolling_settings() -> ScrollingLayoutSettings {
+    ScrollingLayoutSettings::default()
+}
 
 impl Default for ScrollingLayoutSystem {
     fn default() -> Self {
@@ -454,7 +462,9 @@ impl ScrollingLayoutSystem {
         state.request_center_on_selected();
     }
 
-    fn layout_state(&self, layout: LayoutId) -> Option<&LayoutState> { self.layouts.get(layout) }
+    fn layout_state(&self, layout: LayoutId) -> Option<&LayoutState> {
+        self.layouts.get(layout)
+    }
 
     fn layout_state_mut(&mut self, layout: LayoutId) -> Option<&mut LayoutState> {
         self.layouts.get_mut(layout)
@@ -524,10 +534,13 @@ impl ScrollingLayoutSystem {
                 Direction::Right => (col_idx + 1).min(state.columns.len()),
                 _ => return false,
             };
-            state.columns.insert(insert_at, Column {
-                windows: vec![wid],
-                width_offset: 0.0,
-            });
+            state.columns.insert(
+                insert_at,
+                Column {
+                    windows: vec![wid],
+                    width_offset: 0.0,
+                },
+            );
             state.selected = Some(wid);
             return true;
         }
@@ -563,7 +576,9 @@ impl LayoutSystem for ScrollingLayoutSystem {
         self.layouts.insert(cloned)
     }
 
-    fn remove_layout(&mut self, layout: LayoutId) { self.layouts.remove(layout); }
+    fn remove_layout(&mut self, layout: LayoutId) {
+        self.layouts.remove(layout);
+    }
 
     fn draw_tree(&self, layout: LayoutId) -> String {
         let Some(state) = self.layouts.get(layout) else {
@@ -1290,10 +1305,13 @@ impl LayoutSystem for ScrollingLayoutSystem {
         state.columns[col_idx].windows = remaining;
         let mut insert_at = col_idx + 1;
         for wid in moved.iter().copied() {
-            state.columns.insert(insert_at, Column {
-                windows: vec![wid],
-                width_offset: 0.0,
-            });
+            state.columns.insert(
+                insert_at,
+                Column {
+                    windows: vec![wid],
+                    width_offset: 0.0,
+                },
+            );
             insert_at += 1;
         }
         moved
@@ -1322,10 +1340,13 @@ impl LayoutSystem for ScrollingLayoutSystem {
         }
         let wid = state.columns[col_idx].windows.remove(row_idx);
         let insert_at = (col_idx + 1).min(state.columns.len());
-        state.columns.insert(insert_at, Column {
-            windows: vec![wid],
-            width_offset: 0.0,
-        });
+        state.columns.insert(
+            insert_at,
+            Column {
+                windows: vec![wid],
+                width_offset: 0.0,
+            },
+        );
         state.selected = Some(wid);
         state.align_scroll_to_selected();
         state.clamp_scroll_offset();
@@ -1847,6 +1868,51 @@ mod tests {
             "expected anchored mode to snap offset on focus changes, got offsets {} -> {}",
             offset_after_left,
             offset_after_right
+        );
+    }
+
+    #[test]
+    fn anchored_focus_round_trip_is_stable_across_repeated_toggles() {
+        let mut settings = ScrollingLayoutSettings::default();
+        settings.alignment = crate::common::config::ScrollingAlignment::Left;
+        settings.focus_navigation_style =
+            crate::common::config::ScrollingFocusNavigationStyle::Anchored;
+        settings.column_width_ratio = 0.45;
+        settings.min_column_width_ratio = 0.2;
+        settings.max_column_width_ratio = 0.9;
+        let (mut system, layout, w1, w2) = setup_two_windows(settings);
+
+        let screen = screen(1000.0, 800.0);
+        let gaps = GapSettings::default();
+
+        let _ = render(&system, layout, screen, &gaps);
+
+        let _ = system.move_focus(layout, Direction::Left);
+        let _ = render(&system, layout, screen, &gaps);
+        let _ = system.move_focus(layout, Direction::Right);
+        let first_round_trip = render(&system, layout, screen, &gaps);
+
+        let _ = system.move_focus(layout, Direction::Left);
+        let _ = render(&system, layout, screen, &gaps);
+        let _ = system.move_focus(layout, Direction::Right);
+        let second_round_trip = render(&system, layout, screen, &gaps);
+
+        let first_w1 = frame_for(&first_round_trip, w1);
+        let second_w1 = frame_for(&second_round_trip, w1);
+        let first_w2 = frame_for(&first_round_trip, w2);
+        let second_w2 = frame_for(&second_round_trip, w2);
+
+        assert!(
+            (first_w1.origin.x - second_w1.origin.x).abs() < 1.0,
+            "expected left column x to remain stable after repeated focus round trips, got {} -> {}",
+            first_w1.origin.x,
+            second_w1.origin.x
+        );
+        assert!(
+            (first_w2.origin.x - second_w2.origin.x).abs() < 1.0,
+            "expected selected column x to remain stable after repeated focus round trips, got {} -> {}",
+            first_w2.origin.x,
+            second_w2.origin.x
         );
     }
 
