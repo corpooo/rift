@@ -29,6 +29,13 @@ pub struct Animation<'a> {
 
 impl<'a> Animation<'a> {
     pub fn new(fps: f64, duration: f64, _: AnimationEasing) -> Self {
+        // When fps is 0 (or negative), use the display's native refresh rate.
+        // Fall back to 60 Hz if the rate cannot be determined.
+        let fps = if fps > 0.0 {
+            fps
+        } else {
+            crate::sys::display_link::get_display_refresh_rate().unwrap_or(60.0)
+        };
         Animation {
             configured_fps: fps.min(60.0),
             duration: Duration::from_secs_f64(duration.max(0.0)),
