@@ -62,6 +62,9 @@ pub fn data_dir() -> PathBuf {
 pub fn restore_file() -> PathBuf {
     data_dir().join("layout.ron")
 }
+pub fn session_state_file() -> PathBuf {
+    data_dir().join("session.json")
+}
 pub fn config_file() -> PathBuf {
     dirs::home_dir().unwrap().join(".config").join("rift").join("config.toml")
 }

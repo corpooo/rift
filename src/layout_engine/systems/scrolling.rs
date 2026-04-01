@@ -558,8 +558,7 @@ impl ScrollingLayoutSystem {
         // window into its own neighbor column. This is a faster way to undo accidental stacks.
         if state.columns[col_idx].windows.len() > 1 {
             let transferred_fullscreen = state.columns[col_idx].fullscreen;
-            let transferred_fullscreen_within_gaps =
-                state.columns[col_idx].fullscreen_within_gaps;
+            let transferred_fullscreen_within_gaps = state.columns[col_idx].fullscreen_within_gaps;
             let wid = state.columns[col_idx].windows.remove(row_idx);
             state.columns[col_idx].fullscreen = false;
             state.columns[col_idx].fullscreen_within_gaps = false;
@@ -899,7 +898,8 @@ impl LayoutSystem for ScrollingLayoutSystem {
                     CGPoint::new(column_rect.origin.x, y_cursor.round()),
                     CGSize::new(column_rect.size.width, row_height.round()),
                 );
-                if !col.fullscreen && !col.fullscreen_within_gaps && state.fullscreen.contains(wid) {
+                if !col.fullscreen && !col.fullscreen_within_gaps && state.fullscreen.contains(wid)
+                {
                     frame = screen;
                 } else if !col.fullscreen
                     && !col.fullscreen_within_gaps
@@ -1360,10 +1360,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         };
         !state.fullscreen.is_empty()
             || !state.fullscreen_within_gaps.is_empty()
-            || state
-                .columns
-                .iter()
-                .any(|col| col.fullscreen || col.fullscreen_within_gaps)
+            || state.columns.iter().any(|col| col.fullscreen || col.fullscreen_within_gaps)
     }
 
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction) {

@@ -262,6 +262,7 @@ impl VirtualWorkspaceManager {
         config: &VirtualWorkspaceSettings,
         layout_settings: &LayoutSettings,
     ) {
+        self.max_workspaces = 32;
         self.app_rules = config.app_rules.clone();
         self.workspace_rules = config.workspace_rules.clone();
         self.default_layout_mode = layout_settings.mode;
@@ -472,14 +473,12 @@ impl VirtualWorkspaceManager {
         });
 
         let idx = if after_current == Some(true) {
-            self.active_workspace_idx(space)
-                .map(|idx| idx as usize + 1)
-                .unwrap_or_else(|| {
-                    self.workspaces_by_space
-                        .get(&space)
-                        .map(|v: &Vec<VirtualWorkspaceId>| v.len())
-                        .unwrap_or(0)
-                })
+            self.active_workspace_idx(space).map(|idx| idx as usize + 1).unwrap_or_else(|| {
+                self.workspaces_by_space
+                    .get(&space)
+                    .map(|v: &Vec<VirtualWorkspaceId>| v.len())
+                    .unwrap_or(0)
+            })
         } else {
             self.workspaces_by_space
                 .get(&space)
@@ -1791,11 +1790,8 @@ mod tests {
         assert!(manager.set_active_workspace(space, ws2_id));
         assert!(manager.move_workspace(space, ws2_id, Direction::Right));
 
-        let ordered_ids: Vec<_> = manager
-            .list_workspaces(space)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        let ordered_ids: Vec<_> =
+            manager.list_workspaces(space).into_iter().map(|(id, _)| id).collect();
         let ws2_idx = ordered_ids.iter().position(|id| *id == ws2_id).unwrap();
         let ws3_idx = ordered_ids.iter().position(|id| *id == ws3_id).unwrap();
 
@@ -1817,11 +1813,8 @@ mod tests {
             .create_workspace_with_options(space, Some("Inserted".to_string()), Some(true))
             .unwrap();
 
-        let ordered_ids: Vec<_> = manager
-            .list_workspaces(space)
-            .into_iter()
-            .map(|(id, _)| id)
-            .collect();
+        let ordered_ids: Vec<_> =
+            manager.list_workspaces(space).into_iter().map(|(id, _)| id).collect();
 
         let ws2_idx = ordered_ids.iter().position(|id| *id == ws2_id).unwrap();
         let inserted_idx = ordered_ids.iter().position(|id| *id == inserted_id).unwrap();

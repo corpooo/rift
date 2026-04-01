@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::fs;
 use std::path::PathBuf;
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -10,6 +11,7 @@ use crate::actor::app::{AppInfo, WindowId, pid_t};
 use crate::actor::broadcast::{BroadcastEvent, BroadcastSender};
 use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{LayoutMode, LayoutSettings, VirtualWorkspaceSettings};
+use crate::common::session::atomic_write;
 use crate::layout_engine::LayoutSystem;
 use crate::layout_engine::systems::WindowLayoutConstraints;
 use crate::model::virtual_workspace::{
@@ -2041,20 +2043,125 @@ impl LayoutEngine {
         }
     }
 
-    pub fn load(_path: PathBuf) -> anyhow::Result<Self> {
-        Ok(Self::new(
-            &VirtualWorkspaceSettings::default(),
-            &LayoutSettings::default(),
-            None,
-        ))
+    fn rebind_runtime_state(
+        &mut self,
+        virtual_workspace_config: &VirtualWorkspaceSettings,
+        layout_settings: &LayoutSettings,
+        broadcast_tx: Option<BroadcastSender>,
+    ) {
+        self.broadcast_tx = broadcast_tx;
+        self.space_display_map.clear();
+        self.display_last_space.clear();
+        self.focused_window = None;
+        self.window_layout_constraints.clear();
+        self.set_layout_settings(layout_settings);
+        self.update_virtual_workspace_settings(virtual_workspace_config);
     }
 
-    pub fn save(&self, _path: PathBuf) -> std::io::Result<()> {
-        Ok(())
+    pub fn load(
+        path: PathBuf,
+        virtual_workspace_config: &VirtualWorkspaceSettings,
+        layout_settings: &LayoutSettings,
+        broadcast_tx: Option<BroadcastSender>,
+    ) -> anyhow::Result<Self> {
+        let contents = fs::read_to_string(&path)?;
+        let mut layout = match serde_json::from_str::<LayoutEngine>(&contents) {
+            Ok(layout) => layout,
+            Err(_) => ron::de::from_str::<LayoutEngine>(&contents)?,
+        };
+        layout.rebind_runtime_state(virtual_workspace_config, layout_settings, broadcast_tx);
+        Ok(layout)
+    }
+
+    pub fn save(&self, path: PathBuf) -> std::io::Result<()> {
+        let serialized =
+            serde_json::to_string(self).map_err(|err| std::io::Error::other(err.to_string()))?;
+        atomic_write(&path, &serialized)
     }
 
     pub fn serialize_to_string(&self) -> String {
         ron::ser::to_string(&self).unwrap()
+    }
+
+    pub fn seed_single_workspace_order(&mut self, space: SpaceId, app_order: &[pid_t]) -> bool {
+        let workspaces = self.virtual_workspace_manager.list_workspaces(space);
+        if workspaces.len() != 1 {
+            return false;
+        }
+
+        let workspace_id = workspaces[0].0;
+        let layout = self.layout(space);
+        let Some(workspace) = self.virtual_workspace_manager.workspace_info(space, workspace_id)
+        else {
+            return false;
+        };
+
+        let mut existing_order = workspace.layout_system.visible_windows_in_layout(layout);
+        let mut hidden_windows: Vec<_> =
+            workspace.windows().filter(|wid| !existing_order.contains(wid)).collect();
+        hidden_windows.sort();
+        existing_order.extend(hidden_windows);
+
+        if existing_order.len() < 2 {
+            return false;
+        }
+
+        let app_positions: HashMap<pid_t, usize> =
+            app_order.iter().enumerate().map(|(idx, pid)| (*pid, idx)).collect();
+        let current_positions: HashMap<WindowId, usize> =
+            existing_order.iter().enumerate().map(|(idx, wid)| (*wid, idx)).collect();
+
+        let mut seeded_order = existing_order.clone();
+        seeded_order.sort_by(|a, b| {
+            let app_cmp = app_positions
+                .get(&a.pid)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(&app_positions.get(&b.pid).copied().unwrap_or(usize::MAX));
+            if app_cmp == Ordering::Equal {
+                current_positions
+                    .get(a)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    .cmp(&current_positions.get(b).copied().unwrap_or(usize::MAX))
+            } else {
+                app_cmp
+            }
+        });
+
+        if seeded_order == existing_order {
+            return false;
+        }
+
+        let selected = self.workspace_tree(workspace_id).selected_window(layout);
+        let layout_mode = workspace.layout_mode;
+        let mut tiled_order: Vec<_> = seeded_order
+            .into_iter()
+            .filter(|wid| !self.floating.is_floating(*wid))
+            .collect();
+        if tiled_order.is_empty() {
+            return false;
+        }
+
+        let Some(workspace) = self.virtual_workspace_manager.workspaces.get_mut(workspace_id)
+        else {
+            return false;
+        };
+        workspace.layout_system =
+            VirtualWorkspace::create_layout_system(layout_mode, &self.layout_settings);
+        let new_layout = workspace.layout_system.create_layout();
+        self.workspace_layouts
+            .replace_layouts_for_workspace(space, workspace_id, new_layout);
+
+        for wid in tiled_order.drain(..) {
+            workspace.layout_system.add_window_after_selection(new_layout, wid);
+        }
+
+        if let Some(selected) = selected.filter(|wid| !self.floating.is_floating(*wid)) {
+            let _ = workspace.layout_system.select_window(new_layout, selected);
+        }
+
+        true
     }
 
     #[cfg(test)]
@@ -2112,30 +2219,34 @@ impl LayoutEngine {
                 EventResponse::default()
             }
             LayoutCommand::MoveWorkspaceLeft => {
-                let Some(current_workspace) = self.virtual_workspace_manager.active_workspace(space)
+                let Some(current_workspace) =
+                    self.virtual_workspace_manager.active_workspace(space)
                 else {
                     return EventResponse::default();
                 };
 
-                if self
-                    .virtual_workspace_manager
-                    .move_workspace(space, current_workspace, Direction::Left)
-                {
+                if self.virtual_workspace_manager.move_workspace(
+                    space,
+                    current_workspace,
+                    Direction::Left,
+                ) {
                     self.broadcast_workspace_changed(space);
                 }
 
                 EventResponse::default()
             }
             LayoutCommand::MoveWorkspaceRight => {
-                let Some(current_workspace) = self.virtual_workspace_manager.active_workspace(space)
+                let Some(current_workspace) =
+                    self.virtual_workspace_manager.active_workspace(space)
                 else {
                     return EventResponse::default();
                 };
 
-                if self
-                    .virtual_workspace_manager
-                    .move_workspace(space, current_workspace, Direction::Right)
-                {
+                if self.virtual_workspace_manager.move_workspace(
+                    space,
+                    current_workspace,
+                    Direction::Right,
+                ) {
                     self.broadcast_workspace_changed(space);
                 }
 
@@ -2292,10 +2403,7 @@ impl LayoutEngine {
                 self.broadcast_windows_changed(op_space);
                 EventResponse::default()
             }
-            LayoutCommand::CreateWorkspace {
-                after_current,
-                focus,
-            } => {
+            LayoutCommand::CreateWorkspace { after_current, focus } => {
                 match self.virtual_workspace_manager.create_workspace_with_options(
                     space,
                     None,
@@ -2382,9 +2490,8 @@ impl LayoutEngine {
             inferred_space.unwrap_or(space)
         };
 
-        let Some(current_workspace_id) = self
-            .virtual_workspace_manager
-            .workspace_for_window(op_space, focused_window)
+        let Some(current_workspace_id) =
+            self.virtual_workspace_manager.workspace_for_window(op_space, focused_window)
         else {
             return EventResponse::default();
         };
@@ -3251,6 +3358,109 @@ mod tests {
                 Default::default(),
             ),
             before
+        );
+    }
+
+    #[test]
+    fn save_and_load_round_trip_preserves_workspace_order() {
+        let mut engine = test_engine();
+        let space = SpaceId::new(101);
+        let _ = engine.virtual_workspace_manager_mut().list_workspaces(space);
+        let workspaces_before = engine.virtual_workspace_manager_mut().list_workspaces(space);
+        let second_workspace = workspaces_before[1].0;
+        assert!(engine.virtual_workspace_manager_mut().move_workspace(
+            space,
+            second_workspace,
+            Direction::Left
+        ));
+        assert!(
+            engine
+                .virtual_workspace_manager_mut()
+                .set_active_workspace(space, second_workspace)
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("session.ron");
+        engine.save(path.clone()).expect("save layout engine");
+
+        let restored = LayoutEngine::load(
+            path,
+            &VirtualWorkspaceSettings::default(),
+            &LayoutSettings::default(),
+            None,
+        )
+        .expect("load layout engine");
+
+        let expected_workspaces = engine
+            .virtual_workspace_manager_mut()
+            .list_workspaces(space)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        let mut restored = restored;
+        let restored_workspaces = restored
+            .virtual_workspace_manager_mut()
+            .list_workspaces(space)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(restored_workspaces, expected_workspaces);
+        assert_eq!(restored.active_workspace(space), Some(second_workspace));
+    }
+
+    #[test]
+    fn seed_single_workspace_order_reorders_by_app_order() {
+        let mut settings = VirtualWorkspaceSettings::default();
+        settings.default_workspace_count = 1;
+        settings.workspace_names = vec!["Main".to_string()];
+        let mut engine = LayoutEngine::new(&settings, &LayoutSettings::default(), None);
+        let space = SpaceId::new(202);
+        let _ = engine.handle_event(LayoutEvent::SpaceExposed(space, CGSize::new(1200.0, 800.0)));
+
+        let app_b = 6002;
+        let app_a = 6001;
+        let windows = vec![
+            (
+                WindowId::new(app_b, 1),
+                None,
+                None,
+                None,
+                true,
+                CGSize::new(500.0, 500.0),
+                None,
+                None,
+            ),
+            (
+                WindowId::new(app_a, 1),
+                None,
+                None,
+                None,
+                true,
+                CGSize::new(500.0, 500.0),
+                None,
+                None,
+            ),
+        ];
+        let _ = engine.handle_event(LayoutEvent::WindowsOnScreenUpdated(
+            space,
+            app_b,
+            windows[..1].to_vec(),
+            None,
+        ));
+        let _ = engine.handle_event(LayoutEvent::WindowsOnScreenUpdated(
+            space,
+            app_a,
+            windows[1..].to_vec(),
+            None,
+        ));
+
+        assert!(engine.seed_single_workspace_order(space, &[app_a, app_b]));
+        let workspace_id = engine.active_workspace(space).expect("active workspace");
+        let layout = engine.layout(space);
+        assert_eq!(
+            engine.workspace_tree(workspace_id).visible_windows_in_layout(layout),
+            vec![WindowId::new(app_a, 1), WindowId::new(app_b, 1)]
         );
     }
 }

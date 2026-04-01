@@ -227,6 +227,13 @@ impl WmController {
                 for (pid, info) in sys::app::running_apps(None) {
                     self.new_app(pid, info);
                 }
+
+                let events_tx = self.events_tx.clone();
+                queue::main().after_f_s(
+                    Time::new_after(Time::NOW, 2 * 1000000000),
+                    events_tx,
+                    |events_tx| events_tx.send(reactor::Event::FinalizeStartupState),
+                );
             }
             AppLaunch(pid, info) => {
                 self.new_app(pid, info);
@@ -347,23 +354,13 @@ impl WmController {
                 }
             }
             Command(Wm(MoveWindowToNextWorkspace)) => {
-                let skip_empty = if self.config.config.settings.gestures.skip_empty {
-                    Some(true)
-                } else {
-                    None
-                };
                 self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(
-                    layout::LayoutCommand::MoveWindowToNextWorkspace(skip_empty),
+                    layout::LayoutCommand::MoveWindowToNextWorkspace(None),
                 )));
             }
             Command(Wm(MoveWindowToPrevWorkspace)) => {
-                let skip_empty = if self.config.config.settings.gestures.skip_empty {
-                    Some(true)
-                } else {
-                    None
-                };
                 self.events_tx.send(reactor::Event::Command(reactor::Command::Layout(
-                    layout::LayoutCommand::MoveWindowToPrevWorkspace(skip_empty),
+                    layout::LayoutCommand::MoveWindowToPrevWorkspace(None),
                 )));
             }
             Command(Wm(MoveWindowToWorkspace(ws_sel))) => {
@@ -513,6 +510,65 @@ impl ExecCmd {
         match self {
             ExecCmd::Array(vec) => Cow::Borrowed(&*vec),
             ExecCmd::String(s) => s.split(' ').map(|s| s.to_owned()).collect::<Vec<_>>().into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_controller() -> (WmController, actor::Receiver<reactor::Event>) {
+        let (events_tx, events_rx) = actor::channel();
+        let (event_tap_tx, _) = actor::channel();
+        let (stack_line_tx, _) = actor::channel();
+        let (mission_control_tx, _) = actor::channel();
+
+        let mut config = crate::common::config::Config::default();
+        config.settings.gestures.skip_empty = true;
+
+        let (controller, _) = WmController::new(
+            Config {
+                restore_file: PathBuf::from("/tmp/rift-test-restore"),
+                config,
+            },
+            events_tx,
+            event_tap_tx,
+            stack_line_tx,
+            mission_control_tx,
+            None,
+        );
+
+        (controller, events_rx)
+    }
+
+    #[test]
+    fn move_window_to_next_workspace_hotkey_does_not_inherit_swipe_skip_empty() {
+        let (mut controller, mut events_rx) = test_controller();
+
+        controller.handle_event(WmEvent::Command(WmCommand::Wm(WmCmd::MoveWindowToNextWorkspace)));
+
+        let (_, event) = events_rx.try_recv().expect("expected reactor event");
+        match event {
+            reactor::Event::Command(reactor::Command::Layout(
+                layout::LayoutCommand::MoveWindowToNextWorkspace(skip_empty),
+            )) => assert_eq!(skip_empty, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_window_to_prev_workspace_hotkey_does_not_inherit_swipe_skip_empty() {
+        let (mut controller, mut events_rx) = test_controller();
+
+        controller.handle_event(WmEvent::Command(WmCommand::Wm(WmCmd::MoveWindowToPrevWorkspace)));
+
+        let (_, event) = events_rx.try_recv().expect("expected reactor event");
+        match event {
+            reactor::Event::Command(reactor::Command::Layout(
+                layout::LayoutCommand::MoveWindowToPrevWorkspace(skip_empty),
+            )) => assert_eq!(skip_empty, None),
+            other => panic!("unexpected event: {other:?}"),
         }
     }
 }

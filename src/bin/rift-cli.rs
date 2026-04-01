@@ -668,15 +668,12 @@ fn map_workspace_command(cmd: WorkspaceCommands) -> Result<RiftCommand, String> 
                 window_id,
             }),
         )),
-        WorkspaceCommands::Create {
-            after_current,
-            focus,
-        } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-            LC::CreateWorkspace {
+        WorkspaceCommands::Create { after_current, focus } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::CreateWorkspace {
                 after_current: after_current.then_some(true),
                 focus: focus.then_some(true),
-            },
-        ))),
+            }),
+        )),
         WorkspaceCommands::Last => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::SwitchToLastWorkspace,
         ))),

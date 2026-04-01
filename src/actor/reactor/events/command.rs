@@ -1,5 +1,5 @@
-use tracing::{error, info, warn};
 use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 use super::super::ScreenInfo;
 use crate::actor::app::{AppThreadHandle, Quiet, Request, WindowId};
@@ -11,7 +11,7 @@ use crate::actor::stack_line::Event as StackLineEvent;
 use crate::actor::wm_controller::WmEvent;
 use crate::actor::{menu_bar, raise_manager};
 use crate::common::collections::HashMap;
-use crate::common::config::{self as config, Config};
+use crate::common::config::Config;
 use crate::common::log::{MetricsCommand, handle_command};
 use crate::layout_engine::{EventResponse, LayoutCommand, LayoutEvent};
 use crate::sys::window_server::{self as window_server, WindowServerId};
@@ -124,9 +124,7 @@ impl CommandEventHandler {
             }
         };
 
-        if should_prefocus_immediately
-            && let Some(window_id) = response.focus_window
-        {
+        if should_prefocus_immediately && let Some(window_id) = response.focus_window {
             Self::send_immediate_quiet_focus(reactor, window_id);
         }
 
@@ -134,6 +132,7 @@ impl CommandEventHandler {
         if requires_workspace_space {
             reactor.update_event_tap_layout_mode();
         }
+        reactor.mark_session_dirty();
     }
 
     fn send_immediate_quiet_focus(reactor: &Reactor, window_id: WindowId) {
@@ -188,6 +187,7 @@ impl CommandEventHandler {
         }
 
         let _ = reactor.update_layout_or_warn(false, true);
+        reactor.mark_session_dirty();
 
         if old_keys != reactor.config.keys {
             if let Some(wm) = &reactor.communication_manager.wm_sender {
@@ -258,7 +258,12 @@ impl CommandEventHandler {
     }
 
     pub fn handle_command_reactor_save_and_exit(reactor: &mut Reactor) {
-        match reactor.layout_manager.layout_engine.save(config::restore_file()) {
+        let restored = reactor.restore_startup_window_frames();
+        if restored > 0 {
+            std::thread::sleep(std::time::Duration::from_millis((restored.min(12) as u64) * 75));
+        }
+
+        match reactor.persist_session_state_now() {
             Ok(()) => std::process::exit(0),
             Err(e) => {
                 error!("Could not save layout: {e}");
@@ -539,6 +544,7 @@ impl CommandEventHandler {
         reactor.handle_layout_response(response, None);
 
         let _ = reactor.update_layout_or_warn(false, false);
+        reactor.mark_session_dirty();
     }
 
     pub fn handle_command_reactor_close_window(

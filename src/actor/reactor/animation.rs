@@ -1,5 +1,5 @@
-use std::time::{Duration, Instant};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use tracing::{debug, trace};
@@ -26,6 +26,7 @@ pub struct Animation<'a> {
         bool,
         TransactionId,
     )>,
+    jump_windows: Vec<(&'a AppThreadHandle, WindowId, CGRect, TransactionId)>,
 }
 
 impl<'a> Animation<'a> {
@@ -41,6 +42,7 @@ impl<'a> Animation<'a> {
             configured_fps: fps.min(60.0),
             duration: Duration::from_secs_f64(duration.max(0.0)),
             windows: vec![],
+            jump_windows: vec![],
         }
     }
 
@@ -56,8 +58,22 @@ impl<'a> Animation<'a> {
         self.windows.push((handle, wid, start, finish, is_focus, txid))
     }
 
+    pub fn add_jump_window(
+        &mut self,
+        handle: &'a AppThreadHandle,
+        wid: WindowId,
+        target: CGRect,
+        txid: TransactionId,
+    ) {
+        self.jump_windows.push((handle, wid, target, txid))
+    }
+
     pub fn run(self) {
+        if self.windows.is_empty() && self.jump_windows.is_empty() {
+            return;
+        }
         if self.windows.is_empty() {
+            self.skip_to_end();
             return;
         }
 
@@ -115,8 +131,7 @@ impl<'a> Animation<'a> {
                 ),
             > = HashMap::default();
 
-            for (&(handle, wid, from, to, _, txid), rect) in self.windows.iter().zip(&next_frames)
-            {
+            for (&(handle, wid, from, to, _, txid), rect) in self.windows.iter().zip(&next_frames) {
                 let mut rect = *rect;
                 // Round interpolated positions to whole pixels to prevent a
                 // feedback loop: sub-pixel values get rounded by macOS, rift
@@ -126,14 +141,24 @@ impl<'a> Animation<'a> {
                 // Actually don't animate size, too slow. Resize halfway through
                 // and then set the size again at the end, in case it got
                 // clipped during the animation.
-                let entry = batches_by_pid
-                    .entry(wid.pid)
-                    .or_insert((handle, txid, Vec::new(), Vec::new()));
+                let entry =
+                    batches_by_pid.entry(wid.pid).or_insert((handle, txid, Vec::new(), Vec::new()));
                 if should_resize && size_changed(from, to) {
                     rect.size = to.size;
                     entry.2.push((wid, rect));
                 } else {
                     entry.3.push((wid, rect.origin));
+                }
+            }
+            if frame_idx == 1 {
+                for &(handle, wid, target, txid) in &self.jump_windows {
+                    let entry = batches_by_pid.entry(wid.pid).or_insert((
+                        handle,
+                        txid,
+                        Vec::new(),
+                        Vec::new(),
+                    ));
+                    entry.2.push((wid, target));
                 }
             }
 
@@ -203,10 +228,14 @@ impl<'a> Animation<'a> {
         > = HashMap::default();
 
         for &(handle, wid, _from, to, _, txid) in &self.windows {
-            let entry = batches_by_pid
-                .entry(wid.pid)
-                .or_insert((handle, txid, Vec::new(), Vec::new()));
+            let entry =
+                batches_by_pid.entry(wid.pid).or_insert((handle, txid, Vec::new(), Vec::new()));
             entry.2.push((wid, to));
+        }
+        for &(handle, wid, target, txid) in &self.jump_windows {
+            let entry =
+                batches_by_pid.entry(wid.pid).or_insert((handle, txid, Vec::new(), Vec::new()));
+            entry.2.push((wid, target));
         }
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -295,6 +324,13 @@ fn should_skip_scrolling_animation(current: CGRect, target: CGRect, screen: CGRe
         && visible_width_ratio(target, screen) < MIN_VISIBLE_RATIO_FOR_ANIMATION
 }
 
+fn edge_transition_needs_jump(current: CGRect, target: CGRect, screen: CGRect) -> bool {
+    const MIN_VISIBLE_RATIO_FOR_SMOOTH_EDGE_ANIMATION: f64 = 0.5;
+
+    visible_width_ratio(current, screen) < MIN_VISIBLE_RATIO_FOR_SMOOTH_EDGE_ANIMATION
+        || visible_width_ratio(target, screen) < MIN_VISIBLE_RATIO_FOR_SMOOTH_EDGE_ANIMATION
+}
+
 pub struct AnimationManager;
 
 impl AnimationManager {
@@ -317,6 +353,8 @@ impl AnimationManager {
             == LayoutMode::Scrolling)
             .then(|| reactor.space_manager.screen_by_space(space).map(|screen| screen.frame))
             .flatten();
+        const RAISE_TIMEOUT_TROUBLE_TTL_MS: u64 = 20_000;
+        reactor.app_manager.purge_expired_raise_timeouts(RAISE_TIMEOUT_TROUBLE_TTL_MS);
         let mut animated_count = 0;
         let mut animated_wids_wsids: Vec<u32> = Vec::new();
         let mut any_frame_changed = false;
@@ -372,6 +410,12 @@ impl AnimationManager {
             let skip_edge_parked_animation = scrolling_screen.is_some_and(|screen| {
                 should_skip_scrolling_animation(current_frame, target_frame, screen)
             });
+            let trouble_edge_jump = scrolling_screen.is_some_and(|screen| {
+                edge_transition_needs_jump(current_frame, target_frame, screen)
+                    && reactor
+                        .app_manager
+                        .is_window_recently_raise_timed_out(wid, RAISE_TIMEOUT_TROUBLE_TTL_MS)
+            });
             if let Some(screen) = scrolling_screen {
                 let current_visible = visible_width_ratio(current_frame, screen);
                 let target_visible = visible_width_ratio(target_frame, screen);
@@ -384,12 +428,26 @@ impl AnimationManager {
                         current_visible,
                         target_visible,
                         skip_edge_parked_animation,
+                        trouble_edge_jump,
                         "Scrolling animation decision"
                     );
                 }
             }
 
-            if is_active && !skip_edge_parked_animation {
+            if is_active && trouble_edge_jump {
+                trace!(
+                    ?wid,
+                    ?current_frame,
+                    ?target_frame,
+                    "Jumping recently troubled edge window in synchronized batch"
+                );
+                animated_wids_wsids.push(wid.idx.into());
+                anim.add_jump_window(&app_state.handle, wid, target_frame, txid);
+                animated_count += 1;
+                if let Some(wsid) = window_server_id {
+                    reactor.transaction_manager.update_txid_entries([(wsid, txid, target_frame)]);
+                }
+            } else if is_active && !skip_edge_parked_animation {
                 trace!(?wid, ?current_frame, ?target_frame, "Animating visible window");
                 animated_wids_wsids.push(wid.idx.into());
                 anim.add_window(&app_state.handle, wid, current_frame, target_frame, false, txid);
@@ -576,7 +634,10 @@ impl AnimationManager {
 mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
-    use super::{should_skip_scrolling_animation, size_changed, visible_width_ratio};
+    use super::{
+        edge_transition_needs_jump, should_skip_scrolling_animation, size_changed,
+        visible_width_ratio,
+    };
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -627,6 +688,15 @@ mod tests {
         let screen = rect(0.0, 0.0, 3840.0, 1589.0);
         let current = rect(-1719.0, 39.0, 2294.0, 1573.0);
         let target = rect(-2200.0, 39.0, 2294.0, 1573.0);
+        assert!(!should_skip_scrolling_animation(current, target, screen));
+    }
+
+    #[test]
+    fn edge_transition_detection_is_separate_from_hidden_edge_skip() {
+        let screen = rect(0.0, 0.0, 3840.0, 1589.0);
+        let current = rect(-1719.0, 39.0, 2294.0, 1573.0);
+        let target = rect(770.0, 39.0, 2294.0, 1573.0);
+        assert!(edge_transition_needs_jump(current, target, screen));
         assert!(!should_skip_scrolling_animation(current, target, screen));
     }
 

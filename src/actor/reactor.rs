@@ -21,7 +21,7 @@ mod testing;
 mod tests;
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use events::app::AppEventHandler;
 use events::command::CommandEventHandler;
@@ -45,7 +45,7 @@ use crate::actor::raise_manager::{self, RaiseManager, RaiseRequest};
 use crate::actor::reactor::events::window_discovery::WindowDiscoveryHandler;
 use crate::actor::{self, menu_bar, stack_line};
 use crate::common::collections::{BTreeMap, HashMap, HashSet};
-use crate::common::config::Config;
+use crate::common::config::{self, Config};
 use crate::layout_engine::{self as layout, Direction, LayoutEngine, LayoutEvent};
 use crate::model::space_activation::{SpaceActivationConfig, SpaceActivationPolicy};
 use crate::model::tx_store::WindowTxStore;
@@ -226,6 +226,7 @@ pub enum Event {
     /// pending raises that took too long.
     RaiseTimeout {
         sequence_id: u64,
+        pending_windows: Vec<WindowId>,
     },
 
     #[serde(skip)]
@@ -238,6 +239,39 @@ pub enum Event {
 
     #[serde(skip)]
     ConfigUpdated(Config),
+
+    #[serde(skip)]
+    PersistSessionState,
+
+    #[serde(skip)]
+    FinalizeStartupState,
+}
+
+struct SessionPersistenceState {
+    path: std::path::PathBuf,
+    debounce: Duration,
+    dirty: bool,
+    pending_flush: bool,
+    last_dirty: Option<Instant>,
+}
+
+impl SessionPersistenceState {
+    fn new(path: std::path::PathBuf) -> Self {
+        Self {
+            path,
+            debounce: Duration::from_millis(750),
+            dirty: false,
+            pending_flush: false,
+            last_dirty: None,
+        }
+    }
+}
+
+struct StartupStateManager {
+    app_order: Vec<pid_t>,
+    seed_pending: bool,
+    collecting_window_snapshot: bool,
+    startup_window_frames: HashMap<WindowId, CGRect>,
 }
 
 pub struct Reactor {
@@ -260,6 +294,8 @@ pub struct Reactor {
     mission_control_manager: managers::MissionControlManager,
     refocus_manager: managers::RefocusManager,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
+    session_persistence: SessionPersistenceState,
+    startup_state: StartupStateManager,
     active_spaces: HashSet<SpaceId>,
     display_topology_manager: DisplayTopologyManager,
 }
@@ -275,6 +311,8 @@ impl Reactor {
         stack_line_tx: stack_line::Sender,
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
         one_space: bool,
+        startup_app_order: Vec<pid_t>,
+        seed_initial_workspace: bool,
     ) -> ReactorHandle {
         let (events_tx, events) = actor::channel();
         let events_tx_clone = events_tx.clone();
@@ -285,6 +323,8 @@ impl Reactor {
             broadcast_tx,
             window_notify,
             one_space,
+            startup_app_order,
+            seed_initial_workspace,
         );
         reactor.communication_manager.event_tap_tx = Some(event_tap_tx);
         reactor.menu_manager.menu_tx = Some(menu_tx);
@@ -307,6 +347,8 @@ impl Reactor {
         broadcast_tx: BroadcastSender,
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
         one_space: bool,
+        startup_app_order: Vec<pid_t>,
+        seed_initial_workspace: bool,
     ) -> Reactor {
         // FIXME: Remove apps that are no longer running from restored state.
         record.start(&config, &layout_engine);
@@ -380,6 +422,13 @@ impl Reactor {
             pending_space_change_manager: managers::PendingSpaceChangeManager {
                 pending_space_change: None,
                 topology_relayout_pending: false,
+            },
+            session_persistence: SessionPersistenceState::new(config::session_state_file()),
+            startup_state: StartupStateManager {
+                app_order: startup_app_order,
+                seed_pending: seed_initial_workspace,
+                collecting_window_snapshot: true,
+                startup_window_frames: HashMap::default(),
             },
             active_spaces: HashSet::default(),
             display_topology_manager: DisplayTopologyManager::default(),
@@ -1083,14 +1132,20 @@ impl Reactor {
             Event::RaiseCompleted { window_id, sequence_id } => {
                 SystemEventHandler::handle_raise_completed(self, window_id, sequence_id);
             }
-            Event::RaiseTimeout { sequence_id } => {
-                SystemEventHandler::handle_raise_timeout(self, sequence_id);
+            Event::RaiseTimeout { sequence_id, pending_windows } => {
+                SystemEventHandler::handle_raise_timeout(self, sequence_id, pending_windows);
             }
             Event::ConfigUpdated(new_cfg) => {
                 CommandEventHandler::handle_config_updated(self, new_cfg);
             }
             Event::Command(cmd) => {
                 CommandEventHandler::handle_command(self, cmd);
+            }
+            Event::PersistSessionState => {
+                self.persist_session_state_if_ready();
+            }
+            Event::FinalizeStartupState => {
+                self.finalize_startup_state();
             }
             _ => (),
         }
@@ -1817,6 +1872,14 @@ impl Reactor {
     fn send_layout_event(&mut self, event: LayoutEvent) {
         let event_clone = event.clone();
         let response = self.layout_manager.layout_engine.handle_event(event);
+        match &event_clone {
+            LayoutEvent::WindowAdded(_, wid) => self.capture_startup_snapshot_for_window(*wid),
+            LayoutEvent::WindowsOnScreenUpdated(_, _, windows, _) => {
+                self.capture_startup_snapshot_for_windows(windows.iter().map(|(wid, ..)| *wid));
+            }
+            _ => {}
+        }
+        self.mark_session_dirty();
         self.prepare_refocus_after_layout_event(&event_clone);
         self.handle_layout_response(response, None);
         for space in self.space_manager.iter_known_spaces() {
@@ -2987,7 +3050,169 @@ impl Reactor {
             self.layout_manager
                 .layout_engine
                 .store_floating_window_positions(space, &floating_windows_in_workspace);
+            self.mark_session_dirty();
         }
+    }
+
+    pub(crate) fn mark_session_dirty(&mut self) {
+        self.session_persistence.dirty = true;
+        self.session_persistence.last_dirty = Some(Instant::now());
+        if self.session_persistence.pending_flush {
+            return;
+        }
+        self.schedule_session_persist(self.session_persistence.debounce);
+    }
+
+    fn schedule_session_persist(&mut self, delay: Duration) {
+        let Some(events_tx) = self.communication_manager.events_tx.clone() else {
+            return;
+        };
+        self.session_persistence.pending_flush = true;
+        thread::spawn(move || {
+            std::thread::sleep(delay);
+            events_tx.send(Event::PersistSessionState);
+        });
+    }
+
+    fn persist_session_state_if_ready(&mut self) {
+        self.session_persistence.pending_flush = false;
+        if !self.session_persistence.dirty {
+            return;
+        }
+
+        let Some(last_dirty) = self.session_persistence.last_dirty else {
+            return;
+        };
+        let elapsed = last_dirty.elapsed();
+        if elapsed < self.session_persistence.debounce {
+            self.schedule_session_persist(self.session_persistence.debounce - elapsed);
+            return;
+        }
+
+        if let Err(err) = self.persist_session_state_now() {
+            warn!(?err, "Failed to persist Rift session state");
+            self.schedule_session_persist(self.session_persistence.debounce);
+        }
+    }
+
+    pub(crate) fn persist_session_state_now(&mut self) -> std::io::Result<()> {
+        self.layout_manager.layout_engine.save(self.session_persistence.path.clone())?;
+        self.session_persistence.dirty = false;
+        self.session_persistence.last_dirty = None;
+        self.session_persistence.pending_flush = false;
+        Ok(())
+    }
+
+    fn capture_startup_snapshot_for_window(&mut self, wid: WindowId) {
+        if !self.startup_state.collecting_window_snapshot
+            || self.startup_state.startup_window_frames.contains_key(&wid)
+        {
+            return;
+        }
+
+        let Some(window) = self.window_manager.windows.get(&wid) else {
+            return;
+        };
+        if !window.matches_filter(WindowFilter::EffectivelyManageable) {
+            return;
+        }
+
+        self.startup_state.startup_window_frames.insert(wid, window.frame_monotonic);
+    }
+
+    fn capture_startup_snapshot_for_windows(
+        &mut self,
+        windows: impl IntoIterator<Item = WindowId>,
+    ) {
+        for wid in windows {
+            self.capture_startup_snapshot_for_window(wid);
+        }
+    }
+
+    fn finalize_startup_state(&mut self) {
+        if self.startup_state.collecting_window_snapshot {
+            let startup_windows: Vec<_> = self
+                .window_manager
+                .windows
+                .iter()
+                .filter_map(|(&wid, window)| {
+                    window.matches_filter(WindowFilter::EffectivelyManageable).then_some(wid)
+                })
+                .collect();
+            self.capture_startup_snapshot_for_windows(startup_windows);
+            self.startup_state.collecting_window_snapshot = false;
+        }
+
+        if self.startup_state.seed_pending {
+            self.startup_state.seed_pending = false;
+            if self.apply_initial_workspace_seed() {
+                self.mark_session_dirty();
+            }
+        }
+    }
+
+    fn apply_initial_workspace_seed(&mut self) -> bool {
+        let app_order = self.startup_state.app_order.clone();
+        if app_order.is_empty() {
+            return false;
+        }
+
+        let spaces = self
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager()
+            .initialized_spaces();
+
+        let mut changed = false;
+        for space in spaces {
+            if self.layout_manager.layout_engine.seed_single_workspace_order(space, &app_order) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn restore_startup_window_frames(&mut self) -> usize {
+        self.finalize_startup_state();
+
+        let snapshots: Vec<_> = self
+            .startup_state
+            .startup_window_frames
+            .iter()
+            .map(|(wid, frame)| (*wid, *frame))
+            .collect();
+
+        let mut restored = 0;
+        for (wid, frame) in snapshots {
+            let (server_id, should_restore) = match self.window_manager.windows.get(&wid) {
+                Some(window) => (window.info.sys_id, true),
+                None => (None, false),
+            };
+            if !should_restore {
+                continue;
+            }
+
+            let Some(app) = self.app_manager.apps.get(&wid.pid) else {
+                continue;
+            };
+
+            let txid = if let Some(wsid) = server_id {
+                let txid = self.transaction_manager.generate_next_txid(wsid);
+                self.transaction_manager.set_last_sent_txid(wsid, txid);
+                txid
+            } else {
+                TransactionId::default()
+            };
+
+            if app.handle.send(Request::SetWindowFrame(wid, frame, txid, true)).is_ok() {
+                if let Some(window) = self.window_manager.windows.get_mut(&wid) {
+                    window.frame_monotonic = frame;
+                }
+                restored += 1;
+            }
+        }
+
+        restored
     }
 
     pub(crate) fn update_layout_or_warn(

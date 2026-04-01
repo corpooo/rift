@@ -1,8 +1,10 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::process;
+use std::ptr;
 
 use clap::{Parser, Subcommand};
+use nix::libc;
 use objc2::MainThreadMarker;
 use objc2_application_services::AXUIElement;
 use rift_wm::actor::config::ConfigActor;
@@ -17,13 +19,14 @@ use rift_wm::actor::reactor::{self, Reactor};
 use rift_wm::actor::stack_line::StackLine;
 use rift_wm::actor::window_notify as window_notify_actor;
 use rift_wm::actor::wm_controller::{self, WmController};
-use rift_wm::common::config::{Config, config_file, restore_file};
+use rift_wm::common::config::{Config, config_file, restore_file, session_state_file};
 use rift_wm::common::log;
 use rift_wm::common::util::execute_startup_commands;
 use rift_wm::ipc;
 use rift_wm::layout_engine::LayoutEngine;
 use rift_wm::model::tx_store::WindowTxStore;
 use rift_wm::sys::accessibility::ensure_accessibility_permission;
+use rift_wm::sys::app::running_apps;
 use rift_wm::sys::executor::Executor;
 use rift_wm::sys::mach::init_window_sub_level_server_port;
 use rift_wm::sys::screen::{CoordinateConverter, displays_have_separate_spaces};
@@ -89,6 +92,40 @@ async fn supervise(name: &'static str, fut: impl Future<Output = ()>) {
     panic!("{name} exited");
 }
 
+fn install_shutdown_signal_handler(events_tx: reactor::Sender) {
+    unsafe fn make_signal_set() -> libc::sigset_t {
+        let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        unsafe {
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTERM);
+            libc::sigaddset(&mut set, libc::SIGINT);
+        }
+        set
+    }
+
+    let mask_result = unsafe {
+        let set = make_signal_set();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, ptr::null_mut())
+    };
+    if mask_result != 0 {
+        eprintln!("Failed to install shutdown signal mask: {}", mask_result);
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let mut signal_number = 0;
+        let wait_result = unsafe {
+            let set = make_signal_set();
+            libc::sigwait(&set, &mut signal_number)
+        };
+        if wait_result == 0 {
+            events_tx.send(reactor::Event::Command(reactor::Command::Reactor(
+                reactor::ReactorCommand::SaveAndExit,
+            )));
+        }
+    });
+}
+
 fn main() {
     sigpipe::reset();
     let opt = Cli::parse();
@@ -150,12 +187,48 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     execute_startup_commands(&config.settings.run_on_start);
 
     let (broadcast_tx, broadcast_rx) = rift_wm::actor::channel();
-
-    let layout = LayoutEngine::new(
-        &config.virtual_workspaces,
-        &config.settings.layout,
-        Some(broadcast_tx.clone()),
-    );
+    let session_path = session_state_file();
+    let startup_app_order = running_apps(None).map(|(pid, _)| pid).collect::<Vec<_>>();
+    let session_exists = session_path.exists() || restore_file().exists();
+    let layout = if session_path.exists() {
+        LayoutEngine::load(
+            session_path.clone(),
+            &config.virtual_workspaces,
+            &config.settings.layout,
+            Some(broadcast_tx.clone()),
+        )
+        .unwrap_or_else(|_| {
+            LayoutEngine::new(
+                &config.virtual_workspaces,
+                &config.settings.layout,
+                Some(broadcast_tx.clone()),
+            )
+        })
+    } else if restore_file().exists() {
+        LayoutEngine::load(
+            restore_file(),
+            &config.virtual_workspaces,
+            &config.settings.layout,
+            Some(broadcast_tx.clone()),
+        )
+        .unwrap_or_else(|_| {
+            LayoutEngine::new(
+                &config.virtual_workspaces,
+                &config.settings.layout,
+                Some(broadcast_tx.clone()),
+            )
+        })
+    } else {
+        let mut seeded_workspace_config = config.virtual_workspaces.clone();
+        seeded_workspace_config.default_workspace_count = 1;
+        seeded_workspace_config.default_workspace = 0;
+        seeded_workspace_config.workspace_names.truncate(1);
+        LayoutEngine::new(
+            &seeded_workspace_config,
+            &config.settings.layout,
+            Some(broadcast_tx.clone()),
+        )
+    };
     let (event_tap_tx, event_tap_rx) = rift_wm::actor::channel();
     let (menu_tx, menu_rx) = rift_wm::actor::channel();
     let (stack_line_tx, stack_line_rx) = rift_wm::actor::channel();
@@ -171,8 +244,11 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         stack_line_tx.clone(),
         Some((wnd_tx.clone(), window_tx_store.clone())),
         opt.one,
+        startup_app_order,
+        !session_exists,
     );
     let events_tx = reactor.sender();
+    install_shutdown_signal_handler(events_tx.clone());
 
     let config_tx =
         ConfigActor::spawn_with_path(config.clone(), events_tx.clone(), config_path.clone());

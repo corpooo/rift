@@ -109,6 +109,7 @@ impl WindowEventHandler {
         } else {
             debug!(?wid, "Received WindowDestroyed for unknown window - ignoring");
         }
+        reactor.app_manager.clear_raise_timeout_window(wid);
         reactor.window_manager.windows.remove(&wid);
         reactor.send_layout_event(LayoutEvent::WindowRemoved(wid));
 

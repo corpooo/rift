@@ -33,6 +33,7 @@ pub struct WindowManager {
 pub struct AppManager {
     pub apps: HashMap<pid_t, AppState>,
     pub app_rules_recent_targets: HashMap<crate::sys::window_server::WindowServerId, Instant>,
+    pub recent_raise_timeout_windows: HashMap<WindowId, Instant>,
 }
 
 impl AppManager {
@@ -40,6 +41,7 @@ impl AppManager {
         AppManager {
             apps: HashMap::default(),
             app_rules_recent_targets: HashMap::default(),
+            recent_raise_timeout_windows: HashMap::default(),
         }
     }
 
@@ -75,6 +77,40 @@ impl AppManager {
         for k in to_remove {
             self.app_rules_recent_targets.remove(&k);
         }
+    }
+
+    pub fn mark_windows_raise_timed_out<I>(&mut self, windows: I)
+    where
+        I: IntoIterator<Item = WindowId>,
+    {
+        let now = std::time::Instant::now();
+        for wid in windows {
+            self.recent_raise_timeout_windows.insert(wid, now);
+        }
+    }
+
+    pub fn is_window_recently_raise_timed_out(&self, wid: WindowId, ttl_ms: u64) -> bool {
+        if let Some(&ts) = self.recent_raise_timeout_windows.get(&wid) {
+            return ts.elapsed().as_millis() < (ttl_ms as u128);
+        }
+        false
+    }
+
+    pub fn purge_expired_raise_timeouts(&mut self, ttl_ms: u64) {
+        let now = std::time::Instant::now();
+        let mut to_remove = Vec::new();
+        for (wid, &ts) in self.recent_raise_timeout_windows.iter() {
+            if now.duration_since(ts).as_millis() >= (ttl_ms as u128) {
+                to_remove.push(*wid);
+            }
+        }
+        for wid in to_remove {
+            self.recent_raise_timeout_windows.remove(&wid);
+        }
+    }
+
+    pub fn clear_raise_timeout_window(&mut self, wid: WindowId) {
+        self.recent_raise_timeout_windows.remove(&wid);
     }
 }
 

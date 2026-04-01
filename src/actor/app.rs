@@ -7,12 +7,10 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::num::NonZeroU32;
-use std::sync::mpsc::{
-    Receiver as BlockingReceiver, RecvError, Sender as BlockingSender,
-};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver as BlockingReceiver, RecvError, Sender as BlockingSender};
 use std::thread;
 use std::time::{Duration, Instant};
 

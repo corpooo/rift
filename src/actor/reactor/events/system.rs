@@ -69,8 +69,18 @@ impl SystemEventHandler {
         );
     }
 
-    pub fn handle_raise_timeout(reactor: &mut Reactor, sequence_id: u64) {
-        send_raise_event(reactor, raise_manager::Event::RaiseTimeout { sequence_id });
+    pub fn handle_raise_timeout(
+        reactor: &mut Reactor,
+        sequence_id: u64,
+        pending_windows: Vec<WindowId>,
+    ) {
+        reactor
+            .app_manager
+            .mark_windows_raise_timed_out(pending_windows.iter().copied());
+        send_raise_event(
+            reactor,
+            raise_manager::Event::RaiseTimeout { sequence_id, pending_windows },
+        );
     }
 
     pub fn handle_register_wm_sender(reactor: &mut Reactor, sender: WmSender) {

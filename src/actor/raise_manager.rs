@@ -21,6 +21,7 @@ pub enum Event {
     },
     RaiseTimeout {
         sequence_id: u64,
+        pending_windows: Vec<WindowId>,
     },
 }
 
@@ -107,7 +108,14 @@ impl RaiseManager {
                             // relayed back to us. We send these events through
                             // the reactor so that we can record/replay them.
                             sequence.timed_out = true;
-                            events_tx.send(reactor::Event::RaiseTimeout { sequence_id: sequence.sequence_id });
+                            let mut pending_windows: Vec<_> =
+                                sequence.pending_raises.iter().copied().collect();
+                            pending_windows
+                                .sort_by_key(|wid| (wid.pid, wid.idx.get()));
+                            events_tx.send(reactor::Event::RaiseTimeout {
+                                sequence_id: sequence.sequence_id,
+                                pending_windows,
+                            });
                         }
                     }
                 }
@@ -161,7 +169,10 @@ impl RaiseManager {
                     }
                 }
             }
-            Event::RaiseTimeout { sequence_id } => {
+            Event::RaiseTimeout {
+                sequence_id,
+                pending_windows: _,
+            } => {
                 trace!("Raise sequence {} timed out", sequence_id);
 
                 // Clear pending raises for the active sequence if it matches
@@ -468,7 +479,10 @@ mod tests {
             );
 
             // Send timeout directly
-            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
+            raise_manager.handle_message(Event::RaiseTimeout {
+                sequence_id: 1,
+                pending_windows: vec![WindowId::new(1, 1)],
+            });
 
             // Verify that the sequence was completed
             assert!(raise_manager.active_sequence.is_none());
@@ -559,7 +573,10 @@ mod tests {
             );
 
             // Send timeout for the sequence
-            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
+            raise_manager.handle_message(Event::RaiseTimeout {
+                sequence_id: 1,
+                pending_windows: vec![WindowId::new(1, 1), WindowId::new(1, 2)],
+            });
 
             // Check that focus window request was sent after timeout
             let requests = collect_requests(&mut app_rx);
