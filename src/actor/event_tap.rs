@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use objc2::exception;
 use objc2_app_kit::{
-    NSEvent, NSEventPhase, NSEventType, NSMainMenuWindowLevel, NSPopUpMenuWindowLevel,
-    NSTouchPhase, NSTouchType, NSWindowLevel,
+    NSEvent, NSEventModifierFlags, NSEventPhase, NSEventType, NSMainMenuWindowLevel,
+    NSPopUpMenuWindowLevel, NSTouchPhase, NSTouchType, NSWindowLevel,
 };
 use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_core_graphics::{
@@ -20,7 +20,7 @@ use super::stack_line;
 use crate::actor;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
-use crate::common::config::{Config, HapticPattern, LayoutMode};
+use crate::common::config::{Config, GestureModifierMatch, HapticPattern, LayoutMode};
 use crate::common::log::trace_misc;
 use crate::layout_engine::LayoutCommand as LC;
 use crate::sys::event::{self, Hotkey, KeyCode, MouseState, set_mouse_state};
@@ -42,6 +42,8 @@ const MOUSE_MOVE_MIN_INTERVAL_NS_NORMAL: u64 = 8_000_000; // 8ms ~= 125 Hz
 const MOUSE_MOVE_MIN_DISTANCE_PX_SQ_NORMAL: f64 = 4.0; // 2px^2
 const MOUSE_MOVE_MIN_INTERVAL_NS_LOW_POWER: u64 = 16_000_000; // 16ms ~= 62 Hz
 const MOUSE_MOVE_MIN_DISTANCE_PX_SQ_LOW_POWER: f64 = 9.0; // 3px^2
+const SCROLL_WHEEL_DISTANCE_POINT_SCALE: f64 = 1000.0;
+const SCROLL_WHEEL_TOLERANCE_POINT_SCALE: f64 = 100.0;
 
 #[derive(Debug)]
 pub enum Request {
@@ -205,6 +207,14 @@ struct ScrollConfig {
     vertical_tolerance: f64,
     fingers: usize,
     distance_pct: f64,
+    required_modifiers: Option<Modifiers>,
+    modified_horizontal_sensitivity: f64,
+    modified_vertical_sensitivity: f64,
+    modifier_match: GestureModifierMatch,
+    on_left: Option<WmCommand>,
+    on_right: Option<WmCommand>,
+    on_up: Option<WmCommand>,
+    on_down: Option<WmCommand>,
 }
 
 impl ScrollConfig {
@@ -223,6 +233,47 @@ impl ScrollConfig {
             vertical_tolerance: vt_norm,
             fingers: g.fingers.max(1),
             distance_pct: g.distance_pct.clamp(0.01, 1.0),
+            required_modifiers: g.required_modifier_bits(),
+            modified_horizontal_sensitivity: g.modified_horizontal_sensitivity.max(0.01),
+            modified_vertical_sensitivity: g.modified_vertical_sensitivity.max(0.01),
+            modifier_match: g.modifier_match,
+            on_left: g.on_left.clone(),
+            on_right: g.on_right.clone(),
+            on_up: g.on_up.clone(),
+            on_down: g.on_down.clone(),
+        }
+    }
+
+    fn has_directional_bindings(&self) -> bool {
+        self.on_left.is_some()
+            || self.on_right.is_some()
+            || self.on_up.is_some()
+            || self.on_down.is_some()
+    }
+
+    fn uses_scroll_wheel_path(&self) -> bool {
+        self.required_modifiers.is_some()
+    }
+
+    fn modifiers_match(&self, active_modifiers: Modifiers) -> bool {
+        self.required_modifiers.is_none_or(|required| {
+            gesture_modifiers_match(required, active_modifiers, self.modifier_match)
+        })
+    }
+
+    fn command_for_horizontal_direction(&self, delta: f64) -> Option<&WmCommand> {
+        if delta < 0.0 {
+            self.on_left.as_ref()
+        } else {
+            self.on_right.as_ref()
+        }
+    }
+
+    fn command_for_vertical_direction(&self, delta: f64) -> Option<&WmCommand> {
+        if delta < 0.0 {
+            self.on_up.as_ref()
+        } else {
+            self.on_down.as_ref()
         }
     }
 }
@@ -234,7 +285,8 @@ struct ScrollState {
     start_y: f64,
     last_x: f64,
     last_y: f64,
-    accum_dx: f64,
+    accum_primary: f64,
+    axis: ScrollAxis,
 }
 
 impl ScrollState {
@@ -244,8 +296,17 @@ impl ScrollState {
         self.start_y = 0.0;
         self.last_x = 0.0;
         self.last_y = 0.0;
-        self.accum_dx = 0.0;
+        self.accum_primary = 0.0;
+        self.axis = ScrollAxis::Undecided;
     }
+}
+
+#[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
+enum ScrollAxis {
+    #[default]
+    Undecided,
+    Horizontal,
+    Vertical,
 }
 
 struct ScrollHandler {
@@ -303,11 +364,32 @@ impl EventTap {
     }
 
     fn gesture_handlers_enabled(&self) -> bool {
-        self.swipe.borrow().is_some() || self.scroll.borrow().is_some()
+        self.swipe.borrow().is_some()
+            || self
+                .scroll
+                .borrow()
+                .as_ref()
+                .is_some_and(|handler| !handler.cfg.uses_scroll_wheel_path())
+    }
+
+    fn scroll_wheel_handlers_enabled(&self) -> bool {
+        self.scroll
+            .borrow()
+            .as_ref()
+            .is_some_and(|handler| handler.cfg.uses_scroll_wheel_path())
+    }
+
+    fn gesture_modifier_tracking_enabled(&self) -> bool {
+        self.scroll
+            .borrow()
+            .as_ref()
+            .is_some_and(|handler| handler.cfg.required_modifiers.is_some())
     }
 
     fn keyboard_handlers_enabled(&self) -> bool {
-        self.disable_hotkey.borrow().is_some() || !self.hotkeys.borrow().is_empty()
+        self.disable_hotkey.borrow().is_some()
+            || !self.hotkeys.borrow().is_empty()
+            || self.gesture_modifier_tracking_enabled()
     }
 
     fn mouse_move_handlers_enabled(&self) -> bool {
@@ -320,6 +402,7 @@ impl EventTap {
     fn desired_event_mask(&self) -> CGEventMask {
         build_event_mask(
             self.gesture_handlers_enabled(),
+            self.scroll_wheel_handlers_enabled(),
             self.keyboard_handlers_enabled(),
             self.mouse_move_handlers_enabled(),
         )
@@ -388,9 +471,16 @@ impl EventTap {
             .as_ref()
             .map(|target| state.compute_disable_hotkey_active(target))
             .unwrap_or(false);
+        let gesture_handlers_enabled = swipe.is_some()
+            || scroll.as_ref().is_some_and(|handler| !handler.cfg.uses_scroll_wheel_path());
+        let scroll_wheel_handlers_enabled =
+            scroll.as_ref().is_some_and(|handler| handler.cfg.uses_scroll_wheel_path());
+        let gesture_modifier_tracking_enabled =
+            scroll.as_ref().is_some_and(|handler| handler.cfg.required_modifiers.is_some());
         let event_mask = build_event_mask(
-            swipe.is_some() || scroll.is_some(),
-            disable_hotkey.is_some(),
+            gesture_handlers_enabled,
+            scroll_wheel_handlers_enabled,
+            disable_hotkey.is_some() || gesture_modifier_tracking_enabled,
             state.event_processing_enabled
                 && ((state.stack_line_enabled && stack_line_tx.is_some())
                     || Self::focus_follows_mouse_handler_enabled(&state)),
@@ -605,7 +695,58 @@ impl EventTap {
         }
     }
 
+    fn reset_scroll_if_modifiers_mismatch(&self, active_modifiers: Modifiers) {
+        let scroll = self.scroll.borrow();
+        let Some(handler) = scroll.as_ref() else {
+            return;
+        };
+        if !handler.cfg.modifiers_match(active_modifiers) {
+            handler.state.borrow_mut().reset();
+        }
+    }
+
+    fn dispatch_scroll_command(&self, command: &WmCommand) {
+        let Some(wm_sender) = self.wm_sender.as_ref() else {
+            return;
+        };
+        wm_sender.send(WmEvent::Command(command.clone()));
+    }
+
     fn on_event(self: &Rc<Self>, event_type: CGEventType, event: &CGEvent) -> bool {
+        if event_type == CGEventType::ScrollWheel {
+            let scroll_handler = self.scroll.borrow();
+            let Some(handler) =
+                scroll_handler.as_ref().filter(|handler| handler.cfg.uses_scroll_wheel_path())
+            else {
+                return true;
+            };
+
+            let mut state = self.state.borrow_mut();
+            let flags = CGEvent::flags(Some(event));
+            if flags != state.current_flags {
+                state.current_flags = flags;
+                self.refresh_disable_hotkey_state(&mut state);
+                self.reset_scroll_if_modifiers_mismatch(state.active_modifiers());
+            }
+
+            if let Some(nsevent) = NSEvent::eventWithCGEvent(event)
+                && nsevent.r#type() == NSEventType::ScrollWheel
+            {
+                let cursor = CGEvent::location(Some(event));
+                let mode = state.layout_mode_at_point(cursor).unwrap_or(state.default_layout_mode);
+                if matches!(mode, LayoutMode::Scrolling) {
+                    return self.handle_modified_scroll_wheel_event(
+                        handler,
+                        &nsevent,
+                        state.active_modifiers(),
+                    );
+                }
+            }
+
+            handler.state.borrow_mut().reset();
+            return true;
+        }
+
         if event_type.0 == NSEventType::Gesture.0 as u32 {
             let scroll_handler = self.scroll.borrow();
             let swipe_handler = self.swipe.borrow();
@@ -613,15 +754,28 @@ impl EventTap {
                 return true;
             }
 
-            let state = self.state.borrow_mut();
+            let mut state = self.state.borrow_mut();
+            let flags = CGEvent::flags(Some(event));
+            if flags != state.current_flags {
+                state.current_flags = flags;
+                self.refresh_disable_hotkey_state(&mut state);
+                self.reset_scroll_if_modifiers_mismatch(state.active_modifiers());
+            }
+
             if let Some(nsevent) = NSEvent::eventWithCGEvent(event)
                 && nsevent.r#type() == NSEventType::Gesture
             {
                 let cursor = CGEvent::location(Some(event));
                 let mode = state.layout_mode_at_point(cursor).unwrap_or(state.default_layout_mode);
                 let is_scrolling_mode = matches!(mode, LayoutMode::Scrolling);
-                if is_scrolling_mode && let Some(handler) = scroll_handler.as_ref() {
-                    self.handle_scroll_gesture_event(handler, &nsevent);
+                let active_modifiers =
+                    modifiers_from_gesture_event(&nsevent, state.active_modifiers());
+                if is_scrolling_mode {
+                    if let Some(handler) = scroll_handler.as_ref()
+                        && !handler.cfg.uses_scroll_wheel_path()
+                    {
+                        self.handle_scroll_gesture_event(handler, &nsevent, active_modifiers);
+                    }
                 } else if let Some(handler) = swipe_handler.as_ref() {
                     self.handle_gesture_event(handler, &nsevent);
                 }
@@ -641,6 +795,7 @@ impl EventTap {
             if flags != state.current_flags {
                 state.current_flags = flags;
                 self.refresh_disable_hotkey_state(&mut state);
+                self.reset_scroll_if_modifiers_mismatch(state.active_modifiers());
             }
         }
 
@@ -816,13 +971,132 @@ impl EventTap {
         }
     }
 
-    fn handle_scroll_gesture_event(&self, handler: &ScrollHandler, nsevent: &NSEvent) {
+    fn handle_modified_scroll_wheel_event(
+        &self,
+        handler: &ScrollHandler,
+        nsevent: &NSEvent,
+        active_modifiers: Modifiers,
+    ) -> bool {
         let cfg = &handler.cfg;
         let state = &handler.state;
-        let Some(wm_sender) = self.wm_sender.as_ref() else {
+        if self.wm_sender.is_none() || !cfg.uses_scroll_wheel_path() {
+            state.borrow_mut().reset();
+            return true;
+        }
+
+        if !nsevent.hasPreciseScrollingDeltas() {
+            state.borrow_mut().reset();
+            return true;
+        }
+
+        if !cfg.modifiers_match(active_modifiers) {
+            state.borrow_mut().reset();
+            return true;
+        }
+
+        let phase = nsevent.phase();
+        let momentum_phase = nsevent.momentumPhase();
+        if momentum_phase != NSEventPhase::None {
+            state.borrow_mut().reset();
+            return false;
+        }
+
+        let mut st = state.borrow_mut();
+        if phase.contains(NSEventPhase::Ended) || phase.contains(NSEventPhase::Cancelled) {
+            st.reset();
+            return false;
+        }
+        if phase.contains(NSEventPhase::Began) || phase.contains(NSEventPhase::MayBegin) {
+            st.reset();
+            st.phase = GesturePhase::Armed;
+        } else if st.phase == GesturePhase::Idle {
+            st.phase = GesturePhase::Armed;
+        }
+
+        let (dx, dy) = scroll_wheel_finger_delta(nsevent);
+        let horizontal = dx.abs();
+        let vertical = dy.abs();
+        let vertical_tolerance = scroll_wheel_tolerance_threshold(
+            cfg.vertical_tolerance,
+            cfg.modified_vertical_sensitivity,
+        );
+        let step =
+            scroll_wheel_distance_threshold(cfg.distance_pct, cfg.modified_horizontal_sensitivity);
+
+        if horizontal == 0.0 && vertical == 0.0 {
+            return false;
+        }
+
+        if cfg.has_directional_bindings() {
+            if st.axis == ScrollAxis::Undecided {
+                let Some(axis) = classify_scroll_axis(dx, dy, vertical_tolerance) else {
+                    return false;
+                };
+                st.axis = axis;
+            }
+
+            let (primary_delta, orthogonal_delta, command) = match st.axis {
+                ScrollAxis::Horizontal => (dx, vertical, cfg.command_for_horizontal_direction(dx)),
+                ScrollAxis::Vertical => (dy, horizontal, cfg.command_for_vertical_direction(dy)),
+                ScrollAxis::Undecided => return false,
+            };
+
+            if orthogonal_delta > vertical_tolerance {
+                return false;
+            }
+
+            st.accum_primary += primary_delta;
+            let mut dispatched = false;
+            while st.accum_primary.abs() >= step {
+                if let Some(command) = command {
+                    self.dispatch_scroll_command(command);
+                    dispatched = true;
+                }
+                st.accum_primary -= step * st.accum_primary.signum();
+            }
+            if dispatched {
+                st.phase = GesturePhase::Committed;
+            }
+        } else {
+            if vertical > vertical_tolerance || vertical >= horizontal {
+                return false;
+            }
+
+            st.accum_primary += dx;
+            if st.accum_primary.abs() >= step {
+                let delta = if cfg.invert_horizontal {
+                    -st.accum_primary
+                } else {
+                    st.accum_primary
+                };
+                self.dispatch_scroll_command(&WmCommand::ReactorCommand(reactor::Command::Layout(
+                    LC::ScrollStrip { delta },
+                )));
+                st.accum_primary = 0.0;
+                st.phase = GesturePhase::Committed;
+            }
+        }
+
+        false
+    }
+
+    fn handle_scroll_gesture_event(
+        &self,
+        handler: &ScrollHandler,
+        nsevent: &NSEvent,
+        active_modifiers: Modifiers,
+    ) {
+        let cfg = &handler.cfg;
+        let state = &handler.state;
+        if self.wm_sender.is_none() {
             state.borrow_mut().reset();
             return;
-        };
+        }
+
+        if !cfg.modifiers_match(active_modifiers) {
+            state.borrow_mut().reset();
+            return;
+        }
 
         let mut st = state.borrow_mut();
 
@@ -834,19 +1108,6 @@ impl EventTap {
             st.reset();
             return;
         }
-
-        // let phase = nsevent.phase();
-        // if [NSEventPhase::Ended, NSEventPhase::Cancelled].contains(&phase) {
-        //     wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
-        //         reactor::Command::Layout(LC::SnapStrip),
-        //     )));
-        //     st.reset();
-        //     return;
-        // }
-        // if phase == NSEventPhase::Began {
-        //     st.reset();
-        //     return;
-        // }
 
         let touches = nsevent.allTouches();
         let mut sum_x = 0.0f64;
@@ -897,14 +1158,15 @@ impl EventTap {
                 st.start_y = avg_y;
                 st.last_x = avg_x;
                 st.last_y = avg_y;
-                st.accum_dx = 0.0;
+                st.accum_primary = 0.0;
+                st.axis = ScrollAxis::Undecided;
                 st.phase = GesturePhase::Armed;
                 trace!(
                     "scroll armed: start_x={:.3} start_y={:.3}",
                     st.start_x, st.start_y
                 );
             }
-            GesturePhase::Armed => {
+            GesturePhase::Armed | GesturePhase::Committed => {
                 if !all_moved {
                     st.last_x = avg_x;
                     st.last_y = avg_y;
@@ -919,56 +1181,58 @@ impl EventTap {
                 st.last_x = avg_x;
                 st.last_y = avg_y;
 
-                if vertical > cfg.vertical_tolerance || vertical >= horizontal {
-                    return;
-                }
+                if cfg.has_directional_bindings() {
+                    if st.axis == ScrollAxis::Undecided {
+                        let Some(axis) = classify_scroll_axis(dx, dy, cfg.vertical_tolerance)
+                        else {
+                            return;
+                        };
+                        st.axis = axis;
+                    }
 
-                st.accum_dx += dx;
-                let step = cfg.distance_pct;
-                if st.accum_dx.abs() >= step {
-                    let delta = if cfg.invert_horizontal {
-                        -st.accum_dx
-                    } else {
-                        st.accum_dx
+                    let (primary_delta, orthogonal_delta, command) = match st.axis {
+                        ScrollAxis::Horizontal => {
+                            (dx, vertical, cfg.command_for_horizontal_direction(dx))
+                        }
+                        ScrollAxis::Vertical => {
+                            (dy, horizontal, cfg.command_for_vertical_direction(dy))
+                        }
+                        ScrollAxis::Undecided => return,
                     };
-                    let cmd = LC::ScrollStrip { delta };
 
-                    wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
-                        reactor::Command::Layout(cmd),
-                    )));
+                    if orthogonal_delta > cfg.vertical_tolerance {
+                        return;
+                    }
 
-                    st.accum_dx = 0.0;
-                    st.phase = GesturePhase::Committed;
-                }
-            }
-            GesturePhase::Committed => {
-                if active_count == 0 {
-                    st.reset();
+                    st.accum_primary += primary_delta;
+                    let mut dispatched = false;
+                    while st.accum_primary.abs() >= cfg.distance_pct {
+                        if let Some(command) = command {
+                            self.dispatch_scroll_command(command);
+                            dispatched = true;
+                        }
+                        st.accum_primary -= cfg.distance_pct * st.accum_primary.signum();
+                    }
+                    if dispatched {
+                        st.phase = GesturePhase::Committed;
+                    }
                 } else if all_moved {
-                    let dx = avg_x - st.last_x;
-                    let dy = avg_y - st.last_y;
-                    let horizontal = dx.abs();
-                    let vertical = dy.abs();
-                    st.last_x = avg_x;
-                    st.last_y = avg_y;
                     if vertical > cfg.vertical_tolerance || vertical >= horizontal {
                         return;
                     }
-                    st.accum_dx += dx;
-                    let step = cfg.distance_pct;
-                    if st.accum_dx.abs() >= step {
+
+                    st.accum_primary += dx;
+                    if st.accum_primary.abs() >= cfg.distance_pct {
                         let delta = if cfg.invert_horizontal {
-                            -st.accum_dx
+                            -st.accum_primary
                         } else {
-                            st.accum_dx
+                            st.accum_primary
                         };
-                        let cmd = LC::ScrollStrip { delta };
-
-                        wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
-                            reactor::Command::Layout(cmd),
-                        )));
-
-                        st.accum_dx = 0.0;
+                        self.dispatch_scroll_command(&WmCommand::ReactorCommand(
+                            reactor::Command::Layout(LC::ScrollStrip { delta }),
+                        ));
+                        st.accum_primary = 0.0;
+                        st.phase = GesturePhase::Committed;
                     }
                 }
             }
@@ -995,13 +1259,11 @@ impl EventTap {
         let flags = CGEvent::flags(Some(event));
         state.current_flags = flags;
         self.refresh_disable_hotkey_state(state);
+        self.reset_scroll_if_modifiers_mismatch(state.active_modifiers());
 
         if event_type == CGEventType::KeyDown {
             if let Some(key_code) = key_code_opt {
-                let hotkey = Hotkey::new(
-                    modifiers_from_flags_with_keys(state.current_flags, &state.pressed_keys),
-                    key_code,
-                );
+                let hotkey = Hotkey::new(state.active_modifiers(), key_code);
                 let Some(wm_sender) = &self.wm_sender else {
                     debug!(?hotkey, "Hotkey triggered but no WM sender available");
                     return true;
@@ -1039,7 +1301,148 @@ unsafe extern "C-unwind" fn mouse_callback(
     }
 }
 
+fn scroll_wheel_distance_threshold(value: f64, sensitivity: f64) -> f64 {
+    (value * SCROLL_WHEEL_DISTANCE_POINT_SCALE / sensitivity.max(0.01)).max(1.0)
+}
+
+fn scroll_wheel_tolerance_threshold(value: f64, sensitivity: f64) -> f64 {
+    (value * SCROLL_WHEEL_TOLERANCE_POINT_SCALE / sensitivity.max(0.01)).max(1.0)
+}
+
+fn scroll_wheel_finger_delta(nsevent: &NSEvent) -> (f64, f64) {
+    let mut dx = nsevent.scrollingDeltaX() as f64;
+    let mut dy = nsevent.scrollingDeltaY() as f64;
+    if nsevent.isDirectionInvertedFromDevice() {
+        dx = -dx;
+        dy = -dy;
+    }
+    (dx, dy)
+}
+
+fn modifiers_from_gesture_event(nsevent: &NSEvent, tracked_modifiers: Modifiers) -> Modifiers {
+    let flags = nsevent.modifierFlags();
+    if flags.is_empty() {
+        return tracked_modifiers;
+    }
+
+    let mut active = Modifiers::empty();
+    for (event_flag, left, right, generic) in [
+        (
+            NSEventModifierFlags::Shift,
+            Modifiers::SHIFT_LEFT,
+            Modifiers::SHIFT_RIGHT,
+            Modifiers::SHIFT,
+        ),
+        (
+            NSEventModifierFlags::Control,
+            Modifiers::CONTROL_LEFT,
+            Modifiers::CONTROL_RIGHT,
+            Modifiers::CONTROL,
+        ),
+        (
+            NSEventModifierFlags::Option,
+            Modifiers::ALT_LEFT,
+            Modifiers::ALT_RIGHT,
+            Modifiers::ALT,
+        ),
+        (
+            NSEventModifierFlags::Command,
+            Modifiers::META_LEFT,
+            Modifiers::META_RIGHT,
+            Modifiers::META,
+        ),
+    ] {
+        if !flags.contains(event_flag) {
+            continue;
+        }
+
+        let tracked_left = tracked_modifiers.contains(left);
+        let tracked_right = tracked_modifiers.contains(right);
+        if tracked_left {
+            active.insert(left);
+        }
+        if tracked_right {
+            active.insert(right);
+        }
+        if !tracked_left && !tracked_right {
+            active.insert(generic);
+        }
+    }
+
+    active
+}
+
+fn gesture_modifiers_match(
+    required: Modifiers,
+    active: Modifiers,
+    match_mode: GestureModifierMatch,
+) -> bool {
+    for (left, right) in [
+        (Modifiers::SHIFT_LEFT, Modifiers::SHIFT_RIGHT),
+        (Modifiers::CONTROL_LEFT, Modifiers::CONTROL_RIGHT),
+        (Modifiers::ALT_LEFT, Modifiers::ALT_RIGHT),
+        (Modifiers::META_LEFT, Modifiers::META_RIGHT),
+    ] {
+        let required_has_left = required.contains(left);
+        let required_has_right = required.contains(right);
+        let active_has_left = active.contains(left);
+        let active_has_right = active.contains(right);
+        let required_has_family = required_has_left || required_has_right;
+        let active_has_family = active_has_left || active_has_right;
+
+        let family_matches = match match_mode {
+            GestureModifierMatch::Contains => {
+                if required_has_left && required_has_right {
+                    active_has_left || active_has_right
+                } else if required_has_left {
+                    active_has_left
+                } else if required_has_right {
+                    active_has_right
+                } else {
+                    true
+                }
+            }
+            GestureModifierMatch::Exact => {
+                if required_has_family != active_has_family {
+                    false
+                } else if required_has_left && required_has_right {
+                    active_has_left || active_has_right
+                } else if required_has_left {
+                    active_has_left && !active_has_right
+                } else if required_has_right {
+                    active_has_right && !active_has_left
+                } else {
+                    !active_has_family
+                }
+            }
+        };
+
+        if !family_matches {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn classify_scroll_axis(dx: f64, dy: f64, tolerance: f64) -> Option<ScrollAxis> {
+    let horizontal = dx.abs();
+    let vertical = dy.abs();
+
+    if horizontal > vertical && vertical <= tolerance {
+        Some(ScrollAxis::Horizontal)
+    } else if vertical > horizontal && horizontal <= tolerance {
+        Some(ScrollAxis::Vertical)
+    } else {
+        None
+    }
+}
+
 impl State {
+    fn active_modifiers(&self) -> Modifiers {
+        modifiers_from_flags_with_keys(self.current_flags, &self.pressed_keys)
+    }
+
     #[inline]
     fn should_sample_mouse_move(
         &mut self,
@@ -1089,7 +1492,7 @@ impl State {
     }
 
     fn compute_disable_hotkey_active(&self, target: &Hotkey) -> bool {
-        let active_mods = modifiers_from_flags_with_keys(self.current_flags, &self.pressed_keys);
+        let active_mods = self.active_modifiers();
 
         let check_modifier = |left: Modifiers, right: Modifiers| -> bool {
             let target_has_left = target.modifiers.contains(left);
@@ -1281,6 +1684,7 @@ fn touch_normalized_position(touch: &objc2_app_kit::NSTouch) -> Option<(f64, f64
 
 fn build_event_mask(
     gestures_enabled: bool,
+    scroll_wheel_enabled: bool,
     keyboard_enabled: bool,
     mouse_move_enabled: bool,
 ) -> CGEventMask {
@@ -1309,6 +1713,9 @@ fn build_event_mask(
             add(&mut m, ty);
         }
     }
+    if scroll_wheel_enabled {
+        add(&mut m, CGEventType::ScrollWheel);
+    }
     if gestures_enabled {
         // NSEventType::Gesture is an NSEventType — it maps via .0
         *&mut m |= 1u64 << (NSEventType::Gesture.0 as u64);
@@ -1319,6 +1726,14 @@ fn build_event_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mods(items: &[Modifiers]) -> Modifiers {
+        let mut out = Modifiers::empty();
+        for item in items {
+            out.insert(*item);
+        }
+        out
+    }
 
     #[test]
     fn layout_mode_at_point_uses_space_mapping() {
@@ -1350,5 +1765,59 @@ mod tests {
             state.layout_mode_at_point(CGPoint::new(150.0, 50.0)),
             Some(crate::common::config::LayoutMode::Scrolling)
         );
+    }
+
+    #[test]
+    fn exact_modifier_match_rejects_extra_modifier_families() {
+        let required = mods(&[Modifiers::ALT, Modifiers::META]);
+        let active = mods(&[
+            Modifiers::ALT_LEFT,
+            Modifiers::META_RIGHT,
+            Modifiers::SHIFT_LEFT,
+        ]);
+        assert!(!gesture_modifiers_match(
+            required,
+            active,
+            GestureModifierMatch::Exact
+        ));
+    }
+
+    #[test]
+    fn exact_modifier_match_accepts_left_right_variants_for_generic_requirement() {
+        let required = mods(&[Modifiers::ALT, Modifiers::META]);
+        let active = mods(&[Modifiers::ALT_LEFT, Modifiers::META_RIGHT]);
+        assert!(gesture_modifiers_match(
+            required,
+            active,
+            GestureModifierMatch::Exact
+        ));
+    }
+
+    #[test]
+    fn contains_modifier_match_allows_extra_modifier_families() {
+        let required = mods(&[Modifiers::ALT, Modifiers::META]);
+        let active = mods(&[
+            Modifiers::ALT_LEFT,
+            Modifiers::META_RIGHT,
+            Modifiers::SHIFT_LEFT,
+        ]);
+        assert!(gesture_modifiers_match(
+            required,
+            active,
+            GestureModifierMatch::Contains
+        ));
+    }
+
+    #[test]
+    fn classify_scroll_axis_picks_vertical_when_vertical_motion_dominates() {
+        assert_eq!(
+            classify_scroll_axis(0.02, -0.12, 0.05),
+            Some(ScrollAxis::Vertical)
+        );
+    }
+
+    #[test]
+    fn classify_scroll_axis_rejects_diagonal_motion() {
+        assert_eq!(classify_scroll_axis(0.08, 0.09, 0.05), None);
     }
 }
