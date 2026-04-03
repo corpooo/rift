@@ -70,6 +70,8 @@ pub enum LayoutCommand {
     ResizeWindowBy {
         amount: f64,
     },
+    CycleColumnWidthLeft,
+    CycleColumnWidthRight,
 
     /// Scroll the strip by a normalized delta (scaled by column step width)
     ScrollStrip {
@@ -1680,6 +1682,28 @@ impl LayoutEngine {
 
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
                 self.workspace_tree_mut(workspace_id).resize_selection_by(layout, amount);
+                EventResponse::default()
+            }
+            LayoutCommand::CycleColumnWidthLeft => {
+                if is_floating {
+                    return EventResponse::default();
+                }
+
+                self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
+                if let LayoutSystemKind::Scrolling(system) = self.workspace_tree_mut(workspace_id) {
+                    system.cycle_selected_column_width(layout, Direction::Left);
+                }
+                EventResponse::default()
+            }
+            LayoutCommand::CycleColumnWidthRight => {
+                if is_floating {
+                    return EventResponse::default();
+                }
+
+                self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
+                if let LayoutSystemKind::Scrolling(system) = self.workspace_tree_mut(workspace_id) {
+                    system.cycle_selected_column_width(layout, Direction::Right);
+                }
                 EventResponse::default()
             }
             LayoutCommand::AdjustMasterRatio { delta } => {

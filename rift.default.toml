@@ -95,6 +95,9 @@ column_width_ratio = 0.7
 # min_column_width_ratio / max_column_width_ratio: clamp bounds used by resize commands
 min_column_width_ratio = 0.3
 max_column_width_ratio = 0.9
+# Optional preset ratios used by cycle_column_width_left / cycle_column_width_right.
+# If you want 25% or 100% presets, widen the min/max bounds above accordingly.
+# column_width_cycle = [0.25, 0.5, 0.75, 1.0]
 # Alignment for the focused column: "left", "center", or "right"
 alignment = "center"
 # Horizontal focus behavior:
@@ -381,6 +384,7 @@ comb1 = "Alt + Shift"
 # - toggle_column_fullscreen / toggle_column_fullscreen = { within_gaps = true } (scrolling layout only)
 # - toggle_column_fullscreen_within_gaps (compatibility alias)
 # - resize_window_grow / resize_window_shrink / resize_window_by = 0.05
+# - cycle_column_width_left / cycle_column_width_right (scrolling layout only; uses layout.scrolling.column_width_cycle)
 # - swap_windows = [123, 456]
 # - exec = "command" | exec = ["cmd", "arg1", "..."]
 # - move_mouse_to_display = "left"|"right"|"up"|"down"|N|"<display_uuid>"
@@ -396,6 +400,7 @@ comb1 = "Alt + Shift"
 # the following commands *only* work when the scrolling layout is active
 # - scroll_strip = { delta = 0.5 }
 # - snap_strip / center_selection
+# - cycle_column_width_left / cycle_column_width_right
 # - toggle_column_fullscreen / toggle_column_fullscreen = { within_gaps = true }
 # - toggle_column_fullscreen_within_gaps
 
@@ -443,6 +448,8 @@ comb1 = "Alt + Shift"
 # Example scrolling-only bindings:
 # "Alt + Ctrl + F" = "toggle_column_fullscreen"
 # "Alt + Ctrl + Shift + F" = "toggle_column_fullscreen_within_gaps"
+# "Alt + Ctrl + Left" = "cycle_column_width_left"
+# "Alt + Ctrl + Right" = "cycle_column_width_right"
 "comb1 + Ctrl + Space" = "toggle_focus_floating" # briefly bring focus to floating window
 
 # smartly resize windows

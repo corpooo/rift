@@ -355,6 +355,58 @@ impl ScrollingLayoutSystem {
         ratio.clamp(min_ratio, max_ratio).max(0.05)
     }
 
+    fn normalized_cycle_ratios(&self) -> Vec<f64> {
+        let min_ratio = self.settings.min_column_width_ratio;
+        let max_ratio = self.settings.max_column_width_ratio;
+        let mut ratios: Vec<f64> = self
+            .settings
+            .column_width_cycle
+            .iter()
+            .copied()
+            .filter(|ratio| ratio.is_finite())
+            .map(|ratio| Self::clamp_ratio_with_bounds(ratio, min_ratio, max_ratio))
+            .collect();
+        ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ratios.dedup_by(|a, b| (*a - *b).abs() < 0.000_001);
+        ratios
+    }
+
+    fn next_cycle_ratio(current: f64, ratios: &[f64], direction: Direction) -> Option<f64> {
+        const EPSILON: f64 = 0.000_001;
+        if ratios.is_empty() {
+            return None;
+        }
+
+        let current_idx = ratios.iter().position(|ratio| (*ratio - current).abs() < EPSILON);
+
+        match direction {
+            Direction::Left => {
+                if let Some(idx) = current_idx {
+                    Some(ratios[(idx + ratios.len() - 1) % ratios.len()])
+                } else {
+                    ratios
+                        .iter()
+                        .rev()
+                        .copied()
+                        .find(|ratio| *ratio < current)
+                        .or_else(|| ratios.last().copied())
+                }
+            }
+            Direction::Right => {
+                if let Some(idx) = current_idx {
+                    Some(ratios[(idx + 1) % ratios.len()])
+                } else {
+                    ratios
+                        .iter()
+                        .copied()
+                        .find(|ratio| *ratio > current)
+                        .or_else(|| ratios.first().copied())
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn column_widths_and_starts(
         state: &LayoutState,
         screen_width: f64,
@@ -489,6 +541,43 @@ impl ScrollingLayoutSystem {
             return;
         };
         state.request_center_on_selected();
+    }
+
+    pub fn cycle_selected_column_width(&mut self, layout: LayoutId, direction: Direction) {
+        let min_ratio = self.settings.min_column_width_ratio;
+        let max_ratio = self.settings.max_column_width_ratio;
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
+        let cycle_ratios = self.normalized_cycle_ratios();
+        let Some(state) = self.layout_state_mut(layout) else {
+            return;
+        };
+        let Some(next_ratio) = Self::next_cycle_ratio(
+            state
+                .selected_location()
+                .map(|(col_idx, _)| state.column_width_ratio + state.columns[col_idx].width_offset)
+                .unwrap_or(state.column_width_ratio)
+                .clamp(min_ratio, max_ratio)
+                .max(0.05),
+            &cycle_ratios,
+            direction,
+        ) else {
+            return;
+        };
+
+        let base_ratio = state.column_width_ratio;
+        if let Some((col_idx, _)) = state.selected_location() {
+            state.columns[col_idx].width_offset = next_ratio - base_ratio;
+            if niri_navigation {
+                state.reveal_selected_without_direction();
+            } else {
+                state.align_scroll_to_selected();
+            }
+        } else {
+            state.column_width_ratio = next_ratio;
+        }
     }
 
     fn layout_state(&self, layout: LayoutId) -> Option<&LayoutState> {
@@ -1590,6 +1679,12 @@ mod tests {
         )
     }
 
+    fn selected_column_ratio(system: &ScrollingLayoutSystem, layout: LayoutId) -> f64 {
+        let state = system.layouts.get(layout).expect("layout state missing");
+        let (col_idx, _) = state.selected_location().expect("selected column missing");
+        state.column_width_ratio + state.columns[col_idx].width_offset
+    }
+
     fn setup_two_windows(
         settings: ScrollingLayoutSettings,
     ) -> (ScrollingLayoutSystem, LayoutId, WindowId, WindowId) {
@@ -2109,6 +2204,52 @@ mod tests {
             expected_w2_x,
             w2_frame.origin.x
         );
+    }
+
+    #[test]
+    fn cycle_width_commands_follow_configured_presets_and_wrap() {
+        let mut settings = ScrollingLayoutSettings::default();
+        settings.column_width_ratio = 0.5;
+        settings.min_column_width_ratio = 0.25;
+        settings.max_column_width_ratio = 1.0;
+        settings.column_width_cycle = vec![0.25, 0.5, 0.75, 1.0];
+        let (mut system, layout, _, _) = setup_two_windows(settings);
+
+        assert!((selected_column_ratio(&system, layout) - 0.5).abs() < 0.0001);
+
+        system.cycle_selected_column_width(layout, Direction::Right);
+        assert!((selected_column_ratio(&system, layout) - 0.75).abs() < 0.0001);
+
+        system.cycle_selected_column_width(layout, Direction::Right);
+        assert!((selected_column_ratio(&system, layout) - 1.0).abs() < 0.0001);
+
+        system.cycle_selected_column_width(layout, Direction::Right);
+        assert!((selected_column_ratio(&system, layout) - 0.25).abs() < 0.0001);
+
+        system.cycle_selected_column_width(layout, Direction::Left);
+        assert!((selected_column_ratio(&system, layout) - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn cycle_width_commands_choose_neighboring_preset_from_in_between_sizes() {
+        let mut settings = ScrollingLayoutSettings::default();
+        settings.column_width_ratio = 0.5;
+        settings.min_column_width_ratio = 0.25;
+        settings.max_column_width_ratio = 1.0;
+        settings.column_width_cycle = vec![1.0, 0.75, 0.25, 0.5];
+        let (mut system, layout, _, _) = setup_two_windows(settings);
+
+        system.resize_selection_by(layout, 0.1);
+        assert!((selected_column_ratio(&system, layout) - 0.6).abs() < 0.0001);
+
+        system.cycle_selected_column_width(layout, Direction::Right);
+        assert!((selected_column_ratio(&system, layout) - 0.75).abs() < 0.0001);
+
+        system.resize_selection_by(layout, -0.1);
+        assert!((selected_column_ratio(&system, layout) - 0.65).abs() < 0.0001);
+
+        system.cycle_selected_column_width(layout, Direction::Left);
+        assert!((selected_column_ratio(&system, layout) - 0.5).abs() < 0.0001);
     }
 
     #[test]

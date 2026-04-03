@@ -635,6 +635,9 @@ pub struct ScrollingLayoutSettings {
     /// Maximum column width ratio allowed by resize commands.
     #[serde(default = "default_scrolling_max_column_width_ratio")]
     pub max_column_width_ratio: f64,
+    /// Optional preset ratios used by cycle-width commands in scrolling layout.
+    #[serde(default)]
+    pub column_width_cycle: Vec<f64>,
     /// Alignment for the focused column (left, center, right).
     #[serde(default)]
     pub alignment: ScrollingAlignment,
@@ -655,6 +658,7 @@ impl Default for ScrollingLayoutSettings {
             column_width_ratio: default_scrolling_column_width_ratio(),
             min_column_width_ratio: default_scrolling_min_column_width_ratio(),
             max_column_width_ratio: default_scrolling_max_column_width_ratio(),
+            column_width_cycle: Vec::new(),
             alignment: ScrollingAlignment::default(),
             focus_navigation_style: ScrollingFocusNavigationStyle::default(),
             gestures: ScrollingGestureSettings::default(),
@@ -1004,6 +1008,23 @@ impl ScrollingLayoutSettings {
                 "layout.scrolling.column_width_ratio ({}) must be within min/max bounds",
                 self.column_width_ratio
             ));
+        }
+
+        for (idx, ratio) in self.column_width_cycle.iter().copied().enumerate() {
+            if !(0.0..=1.0).contains(&ratio) {
+                issues.push(format!(
+                    "layout.scrolling.column_width_cycle[{}] must be between 0.0 and 1.0, got {}",
+                    idx, ratio
+                ));
+                continue;
+            }
+
+            if !(self.min_column_width_ratio..=self.max_column_width_ratio).contains(&ratio) {
+                issues.push(format!(
+                    "layout.scrolling.column_width_cycle[{}] ({}) must be within min/max bounds",
+                    idx, ratio
+                ));
+            }
         }
 
         if self.gestures.vertical_tolerance < 0.0 {
@@ -1631,10 +1652,15 @@ mod tests {
     }
 
     #[test]
-    fn test_scrolling_gesture_directional_bindings_in_config() {
+    fn test_scrolling_column_width_cycle_in_config() {
         let toml = r#"
             [settings]
             animate = false
+
+            [settings.layout.scrolling]
+            min_column_width_ratio = 0.25
+            max_column_width_ratio = 1.0
+            column_width_cycle = [0.25, 0.5, 0.75, 1.0]
 
             [settings.layout.scrolling.gestures]
             enabled = true
@@ -1642,19 +1668,23 @@ mod tests {
             modified_horizontal_sensitivity = 0.5
             modified_vertical_sensitivity = 1.5
             modifier_match = "exact"
-            on_left = { scroll_strip = { delta = -1.0 } }
-            on_right = { scroll_strip = { delta = 1.0 } }
+            on_left = "cycle_column_width_left"
+            on_right = "cycle_column_width_right"
             on_up = "prev_workspace"
             on_down = "next_workspace"
 
             [keys]
+            "Meta + Alt + Left" = "cycle_column_width_left"
+            "Meta + Alt + Right" = "cycle_column_width_right"
         "#;
 
         let cfg = Config::parse(toml).unwrap();
-        let gestures = &cfg.settings.layout.scrolling.gestures;
+        let scrolling = &cfg.settings.layout.scrolling;
+        let gestures = &scrolling.gestures;
         let mut expected_modifiers = Modifiers::empty();
         expected_modifiers.insert(Modifiers::ALT);
         expected_modifiers.insert(Modifiers::META);
+        assert_eq!(scrolling.column_width_cycle, vec![0.25, 0.5, 0.75, 1.0]);
         assert_eq!(gestures.required_modifier_bits(), Some(expected_modifiers));
         assert_eq!(gestures.modified_horizontal_sensitivity, 0.5);
         assert_eq!(gestures.modified_vertical_sensitivity, 1.5);
@@ -1664,6 +1694,29 @@ mod tests {
         assert!(gestures.on_right.is_some());
         assert!(gestures.on_up.is_some());
         assert!(gestures.on_down.is_some());
+        assert!(!cfg.keys.is_empty());
+    }
+
+    #[test]
+    fn test_scrolling_column_width_cycle_must_respect_bounds() {
+        let toml = r#"
+            [settings]
+            animate = false
+
+            [settings.layout.scrolling]
+            column_width_cycle = [0.25, 0.5, 0.75, 1.0]
+
+            [keys]
+        "#;
+
+        let cfg = Config::parse(toml).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|issue| {
+            issue == "layout.scrolling.column_width_cycle[0] (0.25) must be within min/max bounds"
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue == "layout.scrolling.column_width_cycle[3] (1) must be within min/max bounds"
+        }));
     }
 
     #[test]
