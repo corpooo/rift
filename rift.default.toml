@@ -395,7 +395,7 @@ comb1 = "Alt + Shift"
 
 # the following commands *only* work when the scrolling layout is active
 # - scroll_strip = { delta = 0.5 }
-# - snap_strip / center_selection
+# - snap_strip / commit_scroll_selection / center_selection
 # - toggle_column_fullscreen / toggle_column_fullscreen = { within_gaps = true }
 # - toggle_column_fullscreen_within_gaps
 

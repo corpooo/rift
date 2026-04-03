@@ -240,6 +240,8 @@ enum LayoutCommands {
     ScrollStrip { delta: f64 },
     /// Snap the strip to the nearest column boundary (scrolling layout only)
     SnapStrip,
+    /// Commit the scrolling strip to the most visible window (scrolling layout only)
+    CommitScrollSelection,
     /// Toggle centering of the selected column in scrolling layout.
     /// If invoked again on the same selection, centering is removed.
     CenterSelection,
@@ -732,6 +734,9 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<RiftCommand, String> {
         LayoutCommands::SnapStrip => {
             Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::SnapStrip)))
         }
+        LayoutCommands::CommitScrollSelection => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::CommitScrollSelection),
+        )),
         LayoutCommands::CenterSelection => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::CenterSelection,
         ))),

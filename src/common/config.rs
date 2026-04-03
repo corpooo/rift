@@ -729,7 +729,8 @@ pub struct ScrollingGestureSettings {
     /// Number of fingers required for scroll gesture
     #[serde(default = "default_swipe_fingers")]
     pub fingers: usize,
-    /// Normalized horizontal distance (0..1) required to fire a scroll step
+    /// Normalized horizontal distance (0..1) required to fire a directional scroll step.
+    /// Plain strip scrolling pans continuously.
     #[serde(default = "default_distance_pct")]
     pub distance_pct: f64,
     /// If true, scrolling past the end of the strip will trigger a workspace switch

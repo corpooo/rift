@@ -497,6 +497,69 @@ impl AnimationManager {
         any_frame_changed
     }
 
+    pub fn live_layout(
+        reactor: &mut Reactor,
+        layout: &[(WindowId, CGRect)],
+        skip_wid: Option<WindowId>,
+    ) -> bool {
+        let mut any_frame_changed = false;
+
+        for &(wid, target_frame) in layout {
+            if skip_wid == Some(wid) {
+                trace!(
+                    ?wid,
+                    "Skipping live layout update for window currently being dragged"
+                );
+                continue;
+            }
+
+            let Some(window) = reactor.window_manager.windows.get_mut(&wid) else {
+                debug!(?wid, "Skipping live layout - window no longer exists");
+                continue;
+            };
+            let target_frame = target_frame.round();
+            let current_frame = window.frame_monotonic;
+            if target_frame.same_as(current_frame) {
+                continue;
+            }
+
+            let txid = if let Some(wsid) = window.info.sys_id {
+                if reactor
+                    .transaction_manager
+                    .get_target_frame(wsid)
+                    .is_some_and(|pending| pending.same_as(target_frame))
+                {
+                    trace!(?wid, ?target_frame, "Skipping redundant live layout request");
+                    continue;
+                }
+                let txid = reactor.transaction_manager.generate_next_txid(wsid);
+                reactor.transaction_manager.update_txid_entries([(wsid, txid, target_frame)]);
+                txid
+            } else {
+                TransactionId::default()
+            };
+
+            let Some(app_state) = reactor.app_manager.apps.get(&wid.pid) else {
+                debug!(
+                    ?wid,
+                    "Skipping live layout update for app - app no longer exists"
+                );
+                continue;
+            };
+            if let Err(e) =
+                app_state.handle.send(Request::SetWindowFrame(wid, target_frame, txid, true))
+            {
+                debug!(?wid, ?e, "Failed to send live layout request");
+                continue;
+            }
+
+            window.frame_monotonic = target_frame;
+            any_frame_changed = true;
+        }
+
+        any_frame_changed
+    }
+
     pub fn instant_layout(
         reactor: &mut Reactor,
         layout: &[(WindowId, CGRect)],

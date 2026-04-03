@@ -1002,6 +1002,10 @@ impl Reactor {
                 | Event::ScreenParametersChanged(..)
                 | Event::SpaceChanged(..)
         );
+        let force_live_layout = matches!(
+            &event,
+            Event::Command(Command::Layout(layout::LayoutCommand::ScrollStrip { .. }))
+        );
 
         match event {
             Event::ApplicationLaunched {
@@ -1157,6 +1161,7 @@ impl Reactor {
             window_was_destroyed,
             should_update_notifications,
             force_instant_layout,
+            force_live_layout,
         );
     }
 
@@ -1168,6 +1173,7 @@ impl Reactor {
         window_was_destroyed: bool,
         should_update_notifications: bool,
         force_instant_layout: bool,
+        force_live_layout: bool,
     ) {
         if self.display_topology_manager.is_churning_or_awaiting_commit() {
             return;
@@ -1188,6 +1194,7 @@ impl Reactor {
                     WorkspaceSwitchState::Active
                 ),
                 force_instant_layout,
+                force_live_layout,
                 "Layout update failed",
             );
             self.maybe_send_menu_update();
@@ -3224,6 +3231,7 @@ impl Reactor {
             is_resize,
             is_workspace_switch,
             false,
+            false,
             "Layout update failed",
         )
     }
@@ -3234,7 +3242,13 @@ impl Reactor {
         is_workspace_switch: bool,
         context: &'static str,
     ) -> bool {
-        self.update_layout_or_warn_with_options(is_resize, is_workspace_switch, false, context)
+        self.update_layout_or_warn_with_options(
+            is_resize,
+            is_workspace_switch,
+            false,
+            false,
+            context,
+        )
     }
 
     pub(crate) fn update_layout_or_warn_with_options(
@@ -3242,12 +3256,19 @@ impl Reactor {
         is_resize: bool,
         is_workspace_switch: bool,
         force_instant: bool,
+        force_live: bool,
         context: &'static str,
     ) -> bool {
-        LayoutManager::update_layout(self, is_resize, is_workspace_switch, force_instant)
-            .unwrap_or_else(|e| {
-                warn!(error = ?e, "{}", context);
-                false
-            })
+        LayoutManager::update_layout(
+            self,
+            is_resize,
+            is_workspace_switch,
+            force_instant,
+            force_live,
+        )
+        .unwrap_or_else(|e| {
+            warn!(error = ?e, "{}", context);
+            false
+        })
     }
 }

@@ -695,12 +695,23 @@ impl EventTap {
         }
     }
 
+    fn maybe_commit_strip_scroll(&self, handler: &ScrollHandler) {
+        let should_commit = !handler.cfg.has_directional_bindings()
+            && handler.state.borrow().phase == GesturePhase::Committed;
+        if should_commit {
+            self.dispatch_scroll_command(&WmCommand::ReactorCommand(reactor::Command::Layout(
+                LC::CommitScrollSelection,
+            )));
+        }
+    }
+
     fn reset_scroll_if_modifiers_mismatch(&self, active_modifiers: Modifiers) {
         let scroll = self.scroll.borrow();
         let Some(handler) = scroll.as_ref() else {
             return;
         };
         if !handler.cfg.modifiers_match(active_modifiers) {
+            self.maybe_commit_strip_scroll(handler);
             handler.state.borrow_mut().reset();
         }
     }
@@ -997,13 +1008,16 @@ impl EventTap {
         let phase = nsevent.phase();
         let momentum_phase = nsevent.momentumPhase();
         if momentum_phase != NSEventPhase::None {
+            self.maybe_commit_strip_scroll(handler);
             state.borrow_mut().reset();
             return false;
         }
 
         let mut st = state.borrow_mut();
         if phase.contains(NSEventPhase::Ended) || phase.contains(NSEventPhase::Cancelled) {
-            st.reset();
+            drop(st);
+            self.maybe_commit_strip_scroll(handler);
+            state.borrow_mut().reset();
             return false;
         }
         if phase.contains(NSEventPhase::Began) || phase.contains(NSEventPhase::MayBegin) {
@@ -1062,13 +1076,9 @@ impl EventTap {
                 return false;
             }
 
-            st.accum_primary += dx;
-            if st.accum_primary.abs() >= step {
-                let delta = if cfg.invert_horizontal {
-                    -st.accum_primary
-                } else {
-                    st.accum_primary
-                };
+            let raw_delta = if cfg.invert_horizontal { -dx } else { dx };
+            let delta = scroll_wheel_strip_delta(raw_delta, cfg.modified_horizontal_sensitivity);
+            if delta != 0.0 {
                 self.dispatch_scroll_command(&WmCommand::ReactorCommand(reactor::Command::Layout(
                     LC::ScrollStrip { delta },
                 )));
@@ -1101,10 +1111,13 @@ impl EventTap {
         let mut st = state.borrow_mut();
 
         let phase = nsevent.phase();
-        if matches!(
-            phase,
-            NSEventPhase::Ended | NSEventPhase::Cancelled | NSEventPhase::Began
-        ) {
+        if matches!(phase, NSEventPhase::Ended | NSEventPhase::Cancelled) {
+            drop(st);
+            self.maybe_commit_strip_scroll(handler);
+            state.borrow_mut().reset();
+            return;
+        }
+        if phase == NSEventPhase::Began {
             st.reset();
             return;
         }
@@ -1221,13 +1234,8 @@ impl EventTap {
                         return;
                     }
 
-                    st.accum_primary += dx;
-                    if st.accum_primary.abs() >= cfg.distance_pct {
-                        let delta = if cfg.invert_horizontal {
-                            -st.accum_primary
-                        } else {
-                            st.accum_primary
-                        };
+                    let delta = if cfg.invert_horizontal { -dx } else { dx };
+                    if delta != 0.0 {
                         self.dispatch_scroll_command(&WmCommand::ReactorCommand(
                             reactor::Command::Layout(LC::ScrollStrip { delta }),
                         ));
@@ -1307,6 +1315,10 @@ fn scroll_wheel_distance_threshold(value: f64, sensitivity: f64) -> f64 {
 
 fn scroll_wheel_tolerance_threshold(value: f64, sensitivity: f64) -> f64 {
     (value * SCROLL_WHEEL_TOLERANCE_POINT_SCALE / sensitivity.max(0.01)).max(1.0)
+}
+
+fn scroll_wheel_strip_delta(dx: f64, sensitivity: f64) -> f64 {
+    dx * sensitivity.max(0.01) / SCROLL_WHEEL_DISTANCE_POINT_SCALE
 }
 
 fn scroll_wheel_finger_delta(nsevent: &NSEvent) -> (f64, f64) {
@@ -1819,5 +1831,11 @@ mod tests {
     #[test]
     fn classify_scroll_axis_rejects_diagonal_motion() {
         assert_eq!(classify_scroll_axis(0.08, 0.09, 0.05), None);
+    }
+
+    #[test]
+    fn scroll_wheel_strip_delta_matches_gesture_scale() {
+        assert_eq!(scroll_wheel_strip_delta(80.0, 1.0), 0.08);
+        assert_eq!(scroll_wheel_strip_delta(80.0, 0.5), 0.04);
     }
 }

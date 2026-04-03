@@ -77,6 +77,9 @@ pub enum LayoutCommand {
     },
     /// Snap the strip to the nearest column boundary
     SnapStrip,
+    /// Commit a scrolling gesture by focusing the window with the largest viewport overlap.
+    /// This also re-aligns the strip to the committed selection.
+    CommitScrollSelection,
     /// Toggle centering for the selected column without changing alignment settings.
     /// The center override is cleared when focus moves to a different window.
     CenterSelection,
@@ -171,6 +174,8 @@ pub struct LayoutEngine {
     space_display_map: HashMap<SpaceId, Option<String>>,
     #[serde(skip)]
     display_last_space: HashMap<String, SpaceId>,
+    #[serde(skip)]
+    space_sizes: HashMap<SpaceId, CGSize>,
 }
 
 impl LayoutEngine {
@@ -575,6 +580,56 @@ impl LayoutEngine {
         window: Option<WindowId>,
     ) -> Option<WindowId> {
         window.filter(|wid| self.is_window_in_active_workspace(space, *wid))
+    }
+
+    fn visible_area_in_rect(frame: CGRect, viewport: CGRect) -> f64 {
+        let left = frame.origin.x.max(viewport.origin.x);
+        let top = frame.origin.y.max(viewport.origin.y);
+        let right =
+            (frame.origin.x + frame.size.width).min(viewport.origin.x + viewport.size.width);
+        let bottom =
+            (frame.origin.y + frame.size.height).min(viewport.origin.y + viewport.size.height);
+        let width = (right - left).max(0.0);
+        let height = (bottom - top).max(0.0);
+        width * height
+    }
+
+    fn most_visible_window_in_workspace(
+        &self,
+        space: SpaceId,
+        ws_id: VirtualWorkspaceId,
+        layout: LayoutId,
+    ) -> Option<WindowId> {
+        let size = self.space_sizes.get(&space).copied()?;
+        let screen = CGRect::new(CGPoint::new(0.0, 0.0), size);
+        let gaps = self
+            .layout_settings
+            .gaps
+            .effective_for_display(self.display_uuid_for_space(space).as_deref());
+        let selected = self.workspace_tree(ws_id).selected_window(layout);
+        self.workspace_tree(ws_id)
+            .calculate_layout(
+                layout,
+                screen,
+                self.layout_settings.stack.stack_offset,
+                &self.window_layout_constraints,
+                &gaps,
+                0.0,
+                Default::default(),
+                Default::default(),
+            )
+            .into_iter()
+            .max_by(|(wid_a, frame_a), (wid_b, frame_b)| {
+                let area_a = Self::visible_area_in_rect(*frame_a, screen);
+                let area_b = Self::visible_area_in_rect(*frame_b, screen);
+                area_a.partial_cmp(&area_b).unwrap_or(Ordering::Equal).then_with(
+                    || match selected {
+                        Some(selected) => (*wid_a == selected).cmp(&(*wid_b == selected)),
+                        None => Ordering::Equal,
+                    },
+                )
+            })
+            .map(|(wid, _)| wid)
     }
 
     pub fn resize_selection(
@@ -1066,6 +1121,9 @@ impl LayoutEngine {
         if let Some(uuid) = self.space_display_map.remove(&old_space) {
             self.space_display_map.insert(new_space, uuid);
         }
+        if let Some(size) = self.space_sizes.remove(&old_space) {
+            self.space_sizes.insert(new_space, size);
+        }
 
         for (_uuid, space) in self.display_last_space.iter_mut() {
             if *space == old_space {
@@ -1102,6 +1160,7 @@ impl LayoutEngine {
             broadcast_tx,
             space_display_map: HashMap::default(),
             display_last_space: HashMap::default(),
+            space_sizes: HashMap::default(),
         }
     }
 
@@ -1136,6 +1195,7 @@ impl LayoutEngine {
         match event {
             LayoutEvent::SpaceExposed(space, size) => {
                 self.debug_tree(space);
+                self.space_sizes.insert(space, size);
 
                 let workspaces =
                     self.virtual_workspace_manager_mut().list_workspaces(space).to_vec();
@@ -1723,6 +1783,20 @@ impl LayoutEngine {
                 }
                 EventResponse::default()
             }
+            LayoutCommand::CommitScrollSelection => {
+                let focus_window = match self.workspace_tree(workspace_id) {
+                    LayoutSystemKind::Scrolling(_) => {
+                        self.most_visible_window_in_workspace(space, workspace_id, layout)
+                    }
+                    _ => None,
+                };
+                let response = EventResponse {
+                    focus_window,
+                    ..EventResponse::default()
+                };
+                self.apply_focus_response(space, workspace_id, layout, &response);
+                response
+            }
             LayoutCommand::CenterSelection => {
                 if let LayoutSystemKind::Scrolling(system) = self.workspace_tree_mut(workspace_id) {
                     system.center_selected_column(layout);
@@ -2052,6 +2126,7 @@ impl LayoutEngine {
         self.broadcast_tx = broadcast_tx;
         self.space_display_map.clear();
         self.display_last_space.clear();
+        self.space_sizes.clear();
         self.focused_window = None;
         self.window_layout_constraints.clear();
         self.set_layout_settings(layout_settings);
@@ -3359,6 +3434,63 @@ mod tests {
             ),
             before
         );
+    }
+
+    #[test]
+    fn commit_scroll_selection_focuses_the_most_visible_window() {
+        let mut engine = test_engine();
+        let space = SpaceId::new(94);
+        let screen = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1200.0, 800.0));
+        let pid: pid_t = 5153;
+        let w1 = WindowId::new(pid, 1);
+        let w2 = WindowId::new(pid, 2);
+        let w3 = WindowId::new(pid, 3);
+
+        let _ = engine.handle_event(LayoutEvent::SpaceExposed(space, screen.size));
+        let _ = engine.handle_virtual_workspace_command(
+            space,
+            &LayoutCommand::SetWorkspaceLayout {
+                workspace: None,
+                mode: LayoutMode::Scrolling,
+            },
+        );
+        let _ = engine.handle_event(LayoutEvent::WindowsOnScreenUpdated(
+            space,
+            pid,
+            vec![
+                (w1, None, None, None, true, CGSize::new(500.0, 500.0), None, None),
+                (w2, None, None, None, true, CGSize::new(500.0, 500.0), None, None),
+                (w3, None, None, None, true, CGSize::new(500.0, 500.0), None, None),
+            ],
+            None,
+        ));
+        let _ = engine.handle_event(LayoutEvent::WindowFocused(space, w1));
+        let gaps = engine.layout_settings.gaps.clone();
+        let _ = engine.calculate_layout(
+            space,
+            screen,
+            &gaps,
+            0.0,
+            Default::default(),
+            Default::default(),
+        );
+
+        let _ = engine.handle_command(
+            Some(space),
+            &[space],
+            &HashMap::default(),
+            LayoutCommand::ScrollStrip { delta: 0.8 },
+        );
+
+        let response = engine.handle_command(
+            Some(space),
+            &[space],
+            &HashMap::default(),
+            LayoutCommand::CommitScrollSelection,
+        );
+
+        assert_eq!(response.focus_window, Some(w2));
+        assert_eq!(engine.selected_window(space), Some(w2));
     }
 
     #[test]

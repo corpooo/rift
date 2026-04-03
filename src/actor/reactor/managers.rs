@@ -283,6 +283,7 @@ impl LayoutManager {
         is_resize: bool,
         is_workspace_switch: bool,
         force_instant: bool,
+        force_live: bool,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
         let layout_result = Self::calculate_layout(reactor);
         Self::apply_layout(
@@ -291,6 +292,7 @@ impl LayoutManager {
             is_resize,
             is_workspace_switch,
             force_instant,
+            force_live,
         )
     }
 
@@ -365,6 +367,7 @@ impl LayoutManager {
         is_resize: bool,
         is_workspace_switch: bool,
         force_instant: bool,
+        force_live: bool,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
         let main_window = reactor.main_window();
         trace!(?main_window);
@@ -469,7 +472,9 @@ impl LayoutManager {
             let suppress_animation = force_instant
                 || is_workspace_switch
                 || reactor.workspace_switch_manager.active_workspace_switch.is_some();
-            if suppress_animation {
+            if force_live {
+                any_frame_changed |= AnimationManager::live_layout(reactor, &layout, skip_wid);
+            } else if suppress_animation {
                 any_frame_changed |= AnimationManager::instant_layout(reactor, &layout, skip_wid);
             } else {
                 any_frame_changed |=
