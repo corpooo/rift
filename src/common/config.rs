@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use super::collections::HashMap;
 use crate::actor::wm_controller::WmCommand;
-use crate::sys::hotkey::{Hotkey, HotkeySpec};
+use crate::sys::hotkey::{Hotkey, HotkeySpec, Modifiers};
 
 const MAX_WORKSPACES: usize = 32;
 
@@ -714,7 +714,7 @@ pub enum MasterStackNewWindowPlacement {
     Focused,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct ScrollingGestureSettings {
     /// Enable horizontal scroll gestures to switch columns
@@ -738,6 +738,33 @@ pub struct ScrollingGestureSettings {
     /// Amount of overscroll (in steps) required to trigger a workspace switch
     #[serde(default = "default_overscroll_threshold")]
     pub workspace_switch_threshold: f64,
+    /// Optional modifier-only hotkey spec required for scrolling gestures.
+    /// Example: "Option + Command"
+    #[serde(default)]
+    pub required_modifiers: Option<HotkeySpec>,
+    /// Sensitivity multiplier for modifier-gated horizontal trackpad scrolling.
+    /// Values > 1.0 are more sensitive; values < 1.0 are less sensitive.
+    #[serde(default = "default_modified_horizontal_sensitivity")]
+    pub modified_horizontal_sensitivity: f64,
+    /// Sensitivity multiplier for modifier-gated vertical trackpad scrolling.
+    /// Values > 1.0 are more sensitive; values < 1.0 are less sensitive.
+    #[serde(default = "default_modified_vertical_sensitivity")]
+    pub modified_vertical_sensitivity: f64,
+    /// Whether required_modifiers must match exactly or can be a subset
+    #[serde(default)]
+    pub modifier_match: GestureModifierMatch,
+    /// Optional directional command binding for leftward scroll gestures
+    #[serde(default)]
+    pub on_left: Option<WmCommand>,
+    /// Optional directional command binding for rightward scroll gestures
+    #[serde(default)]
+    pub on_right: Option<WmCommand>,
+    /// Optional directional command binding for upward scroll gestures
+    #[serde(default)]
+    pub on_up: Option<WmCommand>,
+    /// Optional directional command binding for downward scroll gestures
+    #[serde(default)]
+    pub on_down: Option<WmCommand>,
 }
 
 impl Default for ScrollingGestureSettings {
@@ -750,8 +777,40 @@ impl Default for ScrollingGestureSettings {
             distance_pct: default_distance_pct(),
             propagate_to_workspace_swipe: false,
             workspace_switch_threshold: default_overscroll_threshold(),
+            required_modifiers: None,
+            modified_horizontal_sensitivity: default_modified_horizontal_sensitivity(),
+            modified_vertical_sensitivity: default_modified_vertical_sensitivity(),
+            modifier_match: GestureModifierMatch::Exact,
+            on_left: None,
+            on_right: None,
+            on_up: None,
+            on_down: None,
         }
     }
+}
+
+impl ScrollingGestureSettings {
+    pub fn required_modifier_bits(&self) -> Option<Modifiers> {
+        match self.required_modifiers.as_ref() {
+            Some(HotkeySpec::ModifiersOnly { modifiers }) => Some(*modifiers),
+            _ => None,
+        }
+    }
+
+    pub fn has_directional_bindings(&self) -> bool {
+        self.on_left.is_some()
+            || self.on_right.is_some()
+            || self.on_up.is_some()
+            || self.on_down.is_some()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GestureModifierMatch {
+    Contains,
+    #[default]
+    Exact,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
@@ -954,6 +1013,26 @@ impl ScrollingLayoutSettings {
             ));
         }
 
+        if matches!(self.gestures.required_modifiers, Some(HotkeySpec::Hotkey(_))) {
+            issues.push(
+                "layout.scrolling.gestures.required_modifiers must be modifier-only".to_string(),
+            );
+        }
+
+        if self.gestures.modified_horizontal_sensitivity <= 0.0 {
+            issues.push(format!(
+                "layout.scrolling.gestures.modified_horizontal_sensitivity must be positive, got {}",
+                self.gestures.modified_horizontal_sensitivity
+            ));
+        }
+
+        if self.gestures.modified_vertical_sensitivity <= 0.0 {
+            issues.push(format!(
+                "layout.scrolling.gestures.modified_vertical_sensitivity must be positive, got {}",
+                self.gestures.modified_vertical_sensitivity
+            ));
+        }
+
         issues
     }
 }
@@ -1147,6 +1226,12 @@ fn default_distance_pct() -> f64 {
 }
 fn default_overscroll_threshold() -> f64 {
     0.625
+}
+fn default_modified_horizontal_sensitivity() -> f64 {
+    1.0
+}
+fn default_modified_vertical_sensitivity() -> f64 {
+    1.0
 }
 
 fn default_stack_line_spacing() -> f64 {
@@ -1543,6 +1628,88 @@ mod tests {
 
         let cfg = Config::parse(toml).unwrap();
         assert!(!cfg.keys.is_empty());
+    }
+
+    #[test]
+    fn test_scrolling_gesture_directional_bindings_in_config() {
+        let toml = r#"
+            [settings]
+            animate = false
+
+            [settings.layout.scrolling.gestures]
+            enabled = true
+            required_modifiers = "Option + Command"
+            modified_horizontal_sensitivity = 0.5
+            modified_vertical_sensitivity = 1.5
+            modifier_match = "exact"
+            on_left = { scroll_strip = { delta = -1.0 } }
+            on_right = { scroll_strip = { delta = 1.0 } }
+            on_up = "prev_workspace"
+            on_down = "next_workspace"
+
+            [keys]
+        "#;
+
+        let cfg = Config::parse(toml).unwrap();
+        let gestures = &cfg.settings.layout.scrolling.gestures;
+        let mut expected_modifiers = Modifiers::empty();
+        expected_modifiers.insert(Modifiers::ALT);
+        expected_modifiers.insert(Modifiers::META);
+        assert_eq!(gestures.required_modifier_bits(), Some(expected_modifiers));
+        assert_eq!(gestures.modified_horizontal_sensitivity, 0.5);
+        assert_eq!(gestures.modified_vertical_sensitivity, 1.5);
+        assert_eq!(gestures.modifier_match, GestureModifierMatch::Exact);
+        assert!(gestures.has_directional_bindings());
+        assert!(gestures.on_left.is_some());
+        assert!(gestures.on_right.is_some());
+        assert!(gestures.on_up.is_some());
+        assert!(gestures.on_down.is_some());
+    }
+
+    #[test]
+    fn test_scrolling_gesture_required_modifiers_must_be_modifier_only() {
+        let toml = r#"
+            [settings]
+            animate = false
+
+            [settings.layout.scrolling.gestures]
+            enabled = true
+            required_modifiers = "Option + Command + A"
+
+            [keys]
+        "#;
+
+        let cfg = Config::parse(toml).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|issue| {
+            issue == "layout.scrolling.gestures.required_modifiers must be modifier-only"
+        }));
+    }
+
+    #[test]
+    fn test_scrolling_gesture_modified_sensitivity_must_be_positive() {
+        let toml = r#"
+            [settings]
+            animate = false
+
+            [settings.layout.scrolling.gestures]
+            enabled = true
+            modified_horizontal_sensitivity = 0.0
+            modified_vertical_sensitivity = -1.0
+
+            [keys]
+        "#;
+
+        let cfg = Config::parse(toml).unwrap();
+        let issues = cfg.validate();
+        assert!(issues.iter().any(|issue| {
+            issue
+                == "layout.scrolling.gestures.modified_horizontal_sensitivity must be positive, got 0"
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue
+                == "layout.scrolling.gestures.modified_vertical_sensitivity must be positive, got -1"
+        }));
     }
 
     #[test]

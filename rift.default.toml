@@ -115,6 +115,23 @@ invert_horizontal = false
 fingers = 3
 # If true, scrolling past the end of the strip will trigger a workspace switch
 propagate_to_workspace_swipe = false
+# Optional modifier gate for scrolling-layout gestures.
+# Accepts modifier-only syntax like "Option + Command"
+# required_modifiers = "Option + Command"
+# Sensitivity tuning for modifier-gated two-finger trackpad scrolling.
+# Values > 1.0 are more sensitive; values < 1.0 are less sensitive.
+# modified_horizontal_sensitivity = 1.0
+# modified_vertical_sensitivity = 1.0
+# How to match required_modifiers: "exact" or "contains"
+# modifier_match = "exact"
+#
+# Optional directional bindings for scrolling layout gestures.
+# When any of these are set, they override the legacy horizontal strip-scroll behavior.
+# They use the same command syntax as entries under [keys].
+# on_left = { scroll_strip = { delta = -1.0 } }
+# on_right = { scroll_strip = { delta = 1.0 } }
+# on_up = "prev_workspace"
+# on_down = "next_workspace"
 
 [settings.layout.stack]
 # How much of each stacked window sticks out (in pixels)
